@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, LoaderCircle, MonitorUp, PhoneOff, Play, Save, ShieldCheck, Video } from "lucide-react";
+import { CheckCircle2, FileCode2, LoaderCircle, MonitorUp, PhoneOff, Play, Save, ShieldCheck, Video } from "lucide-react";
 import { interviewApi } from "../../../../lib/api.js";
 
 
@@ -55,14 +55,16 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const [message, setMessage] = useState("");
   const [dashboard, setDashboard] = useState(null);
   const [oral, setOral] = useState({ round: null, questions: [] });
-  const [oralDrafts, setOralDrafts] = useState({});
+  const [oralScore, setOralScore] = useState({ rating_out_of_10: "", interviewer_notes: "" });
   const [events, setEvents] = useState([]);
   const [coding, setCoding] = useState(null);
   const [notebook, setNotebook] = useState(null);
   const [answers, setAnswers] = useState({});
+  const [activeCellId, setActiveCellId] = useState("");
   const [runResults, setRunResults] = useState({});
   const [examMinutes, setExamMinutes] = useState(30);
   const [actionBusy, setActionBusy] = useState(false);
+  const [proctorReady, setProctorReady] = useState(false);
   const meetNode = useRef(null);
   const meetingApi = useRef(null);
   const proctorStream = useRef(null);
@@ -76,9 +78,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     const now = Date.now();
     if (eventCooldown.current[key] && now - eventCooldown.current[key] < 4000) return;
     eventCooldown.current[key] = now;
-    void interviewApi.proctorEvent(interview.id, type, severity, { detail }).catch(() => {
-      // Monitoring is best effort and must not interrupt the live interview UI.
-    });
+    void interviewApi.proctorEvent(interview.id, type, severity, { detail });
   }, [companyView, interview.id]);
 
   useEffect(() => () => {
@@ -112,7 +112,6 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       meetingApi.current = api;
       api.addListener("videoConferenceJoined", () => {
         setMeetingJoined(true);
-        if (!companyView) window.setTimeout(() => api.executeCommand("toggleShareScreen"), 700);
       });
       api.addListener("screenSharingStatusChanged", ({ on }) => {
         setScreenShared(Boolean(on));
@@ -129,7 +128,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   }, [joined]);
 
   useEffect(() => {
-    if (!joined || companyView) return undefined;
+    if (!joined || companyView || coding?.status !== "active" || !proctorReady) return undefined;
     const visibility = () => { if (document.hidden) logEvent("TAB_SWITCHED", "HIGH", "Applicant left the interview tab"); };
     const blur = () => logEvent("WINDOW_BLUR", "MEDIUM", "Interview window lost focus");
     const fullscreen = () => { if (!document.fullscreenElement) logEvent("FULLSCREEN_EXIT", "MEDIUM", "Applicant exited full screen"); };
@@ -168,7 +167,16 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       screenTrack?.removeEventListener("ended", stopped);
       cleanups.forEach((cleanup) => cleanup());
     };
-  }, [companyView, joined, logEvent]);
+  }, [coding?.status, companyView, joined, logEvent, proctorReady]);
+
+  useEffect(() => {
+    if (coding?.status === "active") return;
+    screenStream.current?.getTracks().forEach((track) => track.stop());
+    screenStream.current = null;
+    setScreenShared(false);
+    setProctorReady(false);
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
+  }, [coding?.status]);
 
   const poll = useCallback(async () => {
     try {
@@ -182,17 +190,14 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
           interviewApi.codingStatus(interview.id),
         ]);
         setDashboard(nextDashboard); setOral(nextOral); setEvents(nextEvents); setCoding(nextCoding);
-        setOralDrafts((drafts) => {
-          const next = { ...drafts };
-          nextOral.questions.forEach((question) => {
-            if (!next[question.id]) next[question.id] = { rating_out_of_10: question.rating_out_of_10 ?? "", interviewer_notes: question.interviewer_notes || "" };
-          });
-          return next;
-        });
+        setOralScore((draft) => ({
+          rating_out_of_10: draft.rating_out_of_10 === "" ? (nextOral.round?.average_rating ?? "") : draft.rating_out_of_10,
+          interviewer_notes: draft.interviewer_notes || nextOral.round?.interviewer_notes || "",
+        }));
       } else {
         const nextCoding = await interviewApi.codingStatus(interview.id);
         setCoding(nextCoding);
-        if (["active", "completed"].includes(nextCoding.status)) {
+        if (nextCoding.status === "active") {
           const nextNotebook = await interviewApi.notebook(interview.id, credentials.token);
           setNotebook(nextNotebook);
           setAnswers((currentAnswers) => {
@@ -200,6 +205,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
             nextNotebook.cells.forEach((cell) => { if (!(cell.cell_id in next)) next[cell.cell_id] = cell.latest_code || cell.starter_code || ""; });
             return next;
           });
+          setActiveCellId((currentCell) => currentCell || nextNotebook.cells[0]?.cell_id || "");
         }
       }
     } catch (reason) {
@@ -220,20 +226,15 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       if (!credentials.token) throw new Error("Your participant invitation token is missing.");
       await interviewApi.verifyToken(interview.id, credentials.role, credentials.token);
       if (!companyView) {
-        if (!navigator.mediaDevices?.getUserMedia || !navigator.mediaDevices?.getDisplayMedia) throw new Error("This browser does not support the required camera and screen sharing.");
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not support the required camera and microphone.");
         proctorStream.current = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        screenStream.current = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: "monitor" }, audio: false });
-        const displaySurface = screenStream.current.getVideoTracks()[0]?.getSettings?.().displaySurface;
-        if (displaySurface && displaySurface !== "monitor") throw new Error("Choose Entire Screen, not a tab or window.");
-        setScreenShared(true);
-        if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
         await interviewApi.precheck(interview.id, {
           role: credentials.role,
           token: credentials.token,
           camera: proctorStream.current.getVideoTracks().some((track) => track.readyState === "live"),
           microphone: proctorStream.current.getAudioTracks().some((track) => track.readyState === "live"),
-          screen_share: screenStream.current.active,
-          fullscreen: Boolean(document.fullscreenElement),
+          screen_share: false,
+          fullscreen: false,
         });
       }
       await interviewApi.join(interview.id, credentials.role, credentials.token);
@@ -259,17 +260,34 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     await interviewApi.startOral(interview.id);
   }, "Viva started.");
 
-  const saveMark = (question) => perform(() => interviewApi.rateOral(interview.id, question.id, {
-    rating_out_of_10: Number(oralDrafts[question.id]?.rating_out_of_10),
-    interviewer_notes: oralDrafts[question.id]?.interviewer_notes || null,
+  const saveMark = () => perform(() => interviewApi.scoreOral(interview.id, {
+    score: Number(oralScore.rating_out_of_10),
+    notes: oralScore.interviewer_notes || null,
   }), "Mark saved.");
 
   const endViva = () => perform(() => interviewApi.endOral(interview.id), "Viva completed. The proctored round is ready.");
   const startExam = () => perform(() => interviewApi.startCoding(interview.id, examMinutes), "Proctored answer round started.");
-  const generateReport = () => perform(
-    () => interviewApi.generateReport(interview.id),
-    "Final report and PDF generated.",
-  );
+  const skipExam = () => perform(() => interviewApi.skipCoding(interview.id), "Proctored round skipped. The interview is complete.");
+
+  const enterProctoredWorkspace = async () => {
+    setActionBusy(true); setError("");
+    try {
+      if (!navigator.mediaDevices?.getDisplayMedia) throw new Error("This browser does not support screen sharing.");
+      screenStream.current = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: "monitor" }, audio: false });
+      const displaySurface = screenStream.current.getVideoTracks()[0]?.getSettings?.().displaySurface;
+      if (displaySurface && displaySurface !== "monitor") {
+        screenStream.current.getTracks().forEach((track) => track.stop());
+        screenStream.current = null;
+        throw new Error("Choose Entire Screen, not a browser tab or window.");
+      }
+      if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+      setScreenShared(true);
+      setProctorReady(true);
+      logEvent("PROCTORED_WORKSPACE_ENTERED", "LOW", "Entire-screen sharing and full screen enabled");
+    } catch (reason) {
+      setError(reason.message || "Could not enter the proctored workspace");
+    } finally { setActionBusy(false); }
+  };
 
   const updateAnswer = (cellId, value) => {
     setAnswers((items) => ({ ...items, [cellId]: value }));
@@ -293,8 +311,6 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     finally { setActionBusy(false); }
   };
 
-  const requestMeetingShare = () => meetingApi.current?.executeCommand("toggleShareScreen");
-
   const leave = () => {
     meetingApi.current?.dispose?.();
     proctorStream.current?.getTracks().forEach((track) => track.stop());
@@ -304,7 +320,8 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   };
 
   const examActive = coding?.status === "active";
-  const allMarked = oral.questions.length > 0 && oral.questions.every((question) => question.rating_out_of_10 != null);
+  const oralMarked = oral.round?.average_rating != null;
+  const activeCell = notebook?.cells.find((cell) => cell.cell_id === activeCellId) || notebook?.cells[0];
 
   return <div className={`video-room ${examActive && !companyView ? "proctored-mode" : ""}`}>
     <div className="video-room-header">
@@ -316,7 +333,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
     {!joined ? <div className="interview-prejoin-card">
       <Video size={32} color="var(--primary)" /><h2>Ready to join?</h2>
-      <p>{companyView ? "Your company invitation will be verified before entry." : "Allow camera and microphone, select Entire Screen, and stay in full screen during the proctored interview."}</p>
+      <p>{companyView ? "Your company invitation will be verified before entry." : "Allow camera and microphone for the oral video call. Screen sharing is requested later only if the interviewer starts the proctored round."}</p>
       <div className="portal-heading-actions"><button className="btn btn-primary" onClick={enter} disabled={joining}>{joining ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />} Verify & Join</button><button className="btn btn-outline" onClick={leave}>Cancel</button></div>
     </div> : <>
       <div className={`react-interview-layout ${companyView ? "interviewer" : "candidate"}`}>
@@ -326,35 +343,53 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
         {companyView && <aside className="interviewer-control-panel">
           <div className="interview-state-row"><span>Applicant</span><strong>{dashboard?.interview?.candidate_joined ? "Joined" : "Waiting"}</strong></div>
-          <div className="interview-state-row"><span>Stage</span><strong>{coding?.status === "active" ? "Proctored exam" : oral.round?.status === "active" ? "Viva" : oral.round?.status === "completed" ? "Viva completed" : "Waiting"}</strong></div>
+          <div className="interview-state-row"><span>Stage</span><strong>{coding?.status === "active" ? "Proctored exam" : coding?.status === "skipped" ? "Proctoring skipped" : coding?.status === "completed" ? "Evaluation" : oral.round?.status === "active" ? "Oral round" : oral.round?.status === "completed" ? "Oral completed" : "Waiting"}</strong></div>
 
-          {oral.round?.status !== "completed" && <button className="btn btn-primary" disabled={actionBusy || oral.round?.status === "active"} onClick={startViva}><Play size={14} /> Start viva</button>}
-          {oral.questions.map((question, index) => <section className="viva-score-card" key={question.id}>
-            <strong>{index + 1}. {question.question_text}</strong>
-            {question.expected_points && <small>Expected: {question.expected_points}</small>}
-            <label>Mark out of 10<input type="number" min="0" max="10" step="0.5" value={oralDrafts[question.id]?.rating_out_of_10 ?? ""} onChange={(event) => setOralDrafts({ ...oralDrafts, [question.id]: { ...oralDrafts[question.id], rating_out_of_10: event.target.value } })} /></label>
-            <label>Notes<textarea value={oralDrafts[question.id]?.interviewer_notes || ""} onChange={(event) => setOralDrafts({ ...oralDrafts, [question.id]: { ...oralDrafts[question.id], interviewer_notes: event.target.value } })} /></label>
-            <button className="btn btn-outline" disabled={actionBusy || oralDrafts[question.id]?.rating_out_of_10 === ""} onClick={() => saveMark(question)}><Save size={13} /> Save mark</button>
-          </section>)}
-          {oral.round?.status === "active" && <button className="btn btn-primary" disabled={!allMarked || actionBusy} onClick={endViva}><CheckCircle2 size={14} /> Complete viva</button>}
-          {oral.round?.status === "completed" && coding?.status === "not_started" && <div className="start-proctored-box"><label>Exam minutes<input type="number" min="1" max="180" value={examMinutes} onChange={(event) => setExamMinutes(event.target.value)} /></label><button className="btn btn-primary" disabled={actionBusy} onClick={startExam}><MonitorUp size={14} /> Start proctored exam</button></div>}
-          {coding?.status === "completed" && !dashboard?.recommendation && <button className="btn btn-primary" disabled={actionBusy} onClick={generateReport}><Save size={14} /> Generate final report</button>}
-          {dashboard?.recommendation && <div className="start-proctored-box"><strong>Final recommendation</strong><p>{dashboard.recommendation}</p></div>}
+          {oral.round?.status === "not_started" && <button className="btn btn-primary" disabled={actionBusy} onClick={startViva}><Play size={14} /> Start oral round</button>}
+          {oral.round?.status === "active" && <section className="viva-score-card">
+            <strong>Overall oral assessment</strong>
+            <small>No oral questions are stored. Enter one overall interviewer mark.</small>
+            <label>Applicant mark out of 10<input type="number" min="0" max="10" step="0.5" value={oralScore.rating_out_of_10} onChange={(event) => setOralScore({ ...oralScore, rating_out_of_10: event.target.value })} /></label>
+            <label>Interviewer notes<textarea value={oralScore.interviewer_notes} onChange={(event) => setOralScore({ ...oralScore, interviewer_notes: event.target.value })} /></label>
+            <button className="btn btn-outline" disabled={actionBusy || oralScore.rating_out_of_10 === ""} onClick={saveMark}><Save size={13} /> Save oral mark</button>
+          </section>}
+          {oral.round?.status === "active" && <button className="btn btn-primary" disabled={!oralMarked || actionBusy} onClick={endViva}><CheckCircle2 size={14} /> Complete oral round</button>}
+          {oral.round?.status === "completed" && coding?.status === "not_started" && <div className="start-proctored-box">
+            <strong>Choose the next step</strong>
+            <p>Set the paper duration before starting, or finish the interview without showing an answer page to the applicant.</p>
+            <label>Paper time (minutes)<input type="number" min="1" max="180" value={examMinutes} onChange={(event) => setExamMinutes(event.target.value)} /></label>
+            <button className="btn btn-primary" disabled={actionBusy || !dashboard?.coding?.total_questions} onClick={startExam}><MonitorUp size={14} /> Start proctored round</button>
+            <button className="btn btn-outline" disabled={actionBusy} onClick={skipExam}><PhoneOff size={14} /> Skip proctored round</button>
+            {!dashboard?.coding?.total_questions && <small>Add at least one paper question before starting proctoring.</small>}
+          </div>}
+          {coding?.status === "completed" && <div className="start-proctored-box assessment-summary">
+            <strong>Paper evaluation</strong>
+            <p>{coding.evaluation_status === "completed" ? `${coding.marks_awarded} / ${coding.max_marks} marks` : coding.evaluation_error || "Grok evaluation is in progress."}</p>
+            {coding.breakdown?.map((item) => <div className="assessment-breakdown-row" key={item.question_id}><span>Q{item.question_number} · {item.title}</span><strong>{item.marks_awarded ?? "—"} / 5</strong><small>{item.evaluation?.feedback || "Awaiting evaluation"}</small></div>)}
+            {coding.evaluation_status !== "completed" && <button className="btn btn-outline" disabled={actionBusy} onClick={() => perform(() => interviewApi.retryEvaluation(interview.id), "Evaluation refreshed.")}>Retry Grok evaluation</button>}
+          </div>}
           {!!events.length && <div className="proctor-event-list"><h3>Recent flags</h3>{events.slice(0, 6).map((event) => <div key={event.id}><strong>{event.event_type.replaceAll("_", " ")}</strong><span>{event.severity}</span></div>)}</div>}
         </aside>}
       </div>
 
       {!companyView && examActive && <section className="proctored-answer-page">
-        <header><div><h1>Proctored answer round</h1><p>Keep the meeting, camera, microphone, full screen, and entire-screen sharing active.</p></div><div className="proctored-header-actions"><span>{clock(coding.remaining_seconds)}</span>{!screenShared && <button className="btn btn-outline" onClick={requestMeetingShare}><MonitorUp size={14} /> Share entire screen</button>}<button className="btn btn-primary" disabled={actionBusy || !notebook} onClick={submitExam}>Submit all</button></div></header>
-        <div className="proctored-question-list">{notebook?.cells.map((cell, index) => <article className="proctored-question" key={cell.cell_id}>
-          <div className="proctored-question-title"><span>Question {index + 1}</span><strong>{cell.title}</strong></div>
-          <div className="proctored-question-prompt">{cell.description}</div>
-          <textarea spellCheck="false" aria-label={`Answer for ${cell.title}`} value={answers[cell.cell_id] || ""} onChange={(event) => updateAnswer(cell.cell_id, event.target.value)} />
-          {cell.language !== "text" && <div className="proctored-question-actions"><button className="btn btn-outline" disabled={actionBusy} onClick={() => runAnswer(cell)}>Run visible tests</button>{runResults[cell.cell_id] && <span>{runResults[cell.cell_id].status === "disabled" ? "Execution is disabled until a secure runner is configured." : `${runResults[cell.cell_id].passed_tests}/${runResults[cell.cell_id].total_tests} visible tests passed`}</span>}</div>}
-        </article>)}</div>
+        {!proctorReady ? <div className="proctor-permission-card"><ShieldCheck size={36} /><h2>Enter the secure answer workspace</h2><p>The timer is running. Share your Entire Screen and enter full screen to open the paper. The video call will continue securely in the background.</p><button className="btn btn-primary" disabled={actionBusy} onClick={enterProctoredWorkspace}><MonitorUp size={15} /> Share entire screen & continue</button></div> : <>
+          <header><div><h1><FileCode2 size={20} /> HireIQ Paper</h1><p>Autosaved · each question carries 5 marks · Grok evaluates the submitted PDF.</p></div><div className="proctored-header-actions"><span>{clock(coding.remaining_seconds)}</span>{!screenShared && <button className="btn btn-outline" onClick={enterProctoredWorkspace}><MonitorUp size={14} /> Resume screen share</button>}<button className="btn btn-primary" disabled={actionBusy || !notebook} onClick={submitExam}>Submit paper</button></div></header>
+          <div className="proctored-workbench">
+            <aside className="paper-explorer"><strong>EXPLORER</strong><span>QUESTIONS</span>{notebook?.cells.map((cell, index) => <button className={cell.cell_id === activeCell?.cell_id ? "active" : ""} key={cell.cell_id} onClick={() => setActiveCellId(cell.cell_id)}><FileCode2 size={13} /> Q{index + 1} · {cell.title}</button>)}</aside>
+            {activeCell && <article className="proctored-question" key={activeCell.cell_id}>
+              <div className="editor-tab"><FileCode2 size={13} /> {activeCell.title}<span>5 marks</span></div>
+              <div className="proctored-question-prompt">{activeCell.description}</div>
+              <div className="editor-breadcrumb">paper › {activeCell.language === "text" ? "answer.md" : `answer.${activeCell.language === "python" ? "py" : "txt"}`}</div>
+              <textarea spellCheck="false" aria-label={`Answer for ${activeCell.title}`} value={answers[activeCell.cell_id] || ""} onChange={(event) => updateAnswer(activeCell.cell_id, event.target.value)} />
+              {activeCell.language !== "text" && <div className="proctored-question-actions"><button className="btn btn-outline" disabled={actionBusy} onClick={() => runAnswer(activeCell)}>Run visible tests</button>{runResults[activeCell.cell_id] && <span>{runResults[activeCell.cell_id].status === "disabled" ? "Execution is disabled until a secure runner is configured." : `${runResults[activeCell.cell_id].passed_tests}/${runResults[activeCell.cell_id].total_tests} visible tests passed`}</span>}</div>}
+            </article>}
+          </div>
+          <footer className="editor-status-bar"><span>HireIQ Proctored</span><span>{screenShared ? "Entire screen shared" : "Screen share stopped"} · UTF-8 · Autosave on</span></footer>
+        </>}
       </section>}
 
-      {!companyView && coding?.status === "completed" && <div className="interview-complete-overlay"><CheckCircle2 size={42} /><h2>Answers submitted</h2><p>Your interview is complete.</p><button className="btn btn-primary" onClick={leave}>Return to HireIQ</button></div>}
+      {!companyView && ["completed", "skipped"].includes(coding?.status) && <div className="interview-complete-overlay"><CheckCircle2 size={42} /><h2>{coding.status === "skipped" ? "Interview completed" : "Paper submitted"}</h2><p>{coding.status === "skipped" ? "The interviewer skipped the proctored round, so no question page was opened." : "Your PDF answer sheet was generated and sent for evaluation."}</p><button className="btn btn-primary" onClick={leave}>Return to HireIQ</button></div>}
 
       <div className="video-room-controls"><button className="video-control-btn leave" onClick={leave}><PhoneOff size={18} /><span>Leave HireIQ</span></button></div>
     </>}

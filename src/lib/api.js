@@ -1,8 +1,7 @@
 import { supabase } from "./supabase.js";
 
-// An empty API origin means "use the current origin". Vite proxies these
-// requests during development and the production web server does the same in
-// Docker, which keeps browser configuration independent of machine addresses.
+// Empty API origins intentionally use the current origin. Vite and the
+// production container proxy /api and /health for the monorepo deployment.
 const API_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
 const INTERVIEW_API_URL = (
   import.meta.env.VITE_INTERVIEW_API_URL || `${API_URL}/api/v1`
@@ -23,6 +22,81 @@ function errorDetails(payload, status) {
   return {
     message: body?.message || `Request failed with HTTP ${status}`,
     code: body?.code || "API_ERROR",
+  };
+}
+
+function normalizeInterview(item) {
+  if (!item || typeof item !== "object") return item;
+  return {
+    ...item,
+    display_status: item.display_status || item.interview_status || "pending",
+    scheduling_status: item.scheduling_status || item.display_status || item.interview_status || "pending",
+    join_url: item.join_url || item.interview_room_url || item.interview_url || "",
+    oral_score: item.oral_score ?? item.oral?.score ?? item.oral_round?.score ?? null,
+    oral_max_score: item.oral_max_score ?? item.oral?.maximum_score ?? item.oral_round?.maximum_score ?? 10,
+  };
+}
+
+function normalizeOralRound(payload) {
+  const source = payload?.round || payload || {};
+  const score = source.score
+    ?? source.oral_score
+    ?? source.rating_out_of_10
+    ?? source.average_rating
+    ?? null;
+  const status = source.status === "in_progress" ? "active" : source.status;
+  const round = {
+    ...source,
+    status,
+    score,
+    oral_score: score,
+    oral_max_score: source.oral_max_score ?? source.maximum_score ?? source.max_score ?? 10,
+    average_rating: score,
+    interviewer_notes: source.interviewer_notes ?? source.notes ?? "",
+  };
+  return payload?.round ? { ...payload, round } : { round, questions: [] };
+}
+
+function normalizedCodingStatus(status) {
+  if (["in_progress", "started"].includes(status)) return "active";
+  if (["submitted", "evaluating", "evaluated", "failed"].includes(status)) return "completed";
+  if (status === "pending") return "not_started";
+  return status;
+}
+
+function normalizeCodingRound(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const workflowStatus = payload.workflow_status || payload.status || "not_started";
+  const evaluationStatus = payload.evaluation_status
+    || (workflowStatus === "evaluated" ? "completed" : workflowStatus === "evaluating" ? "processing" : workflowStatus === "failed" ? "failed" : "pending");
+  const breakdown = (payload.question_breakdown || payload.breakdown || []).map((item, index) => ({
+    ...item,
+    question_number: item.question_number ?? index + 1,
+    title: item.title || item.question || `Question ${index + 1}`,
+    max_marks: item.max_marks ?? item.maximum_marks ?? 5,
+    evaluation: item.evaluation || {
+      feedback: item.feedback || "",
+      strengths: item.strengths || [],
+      improvements: item.improvements || [],
+    },
+  }));
+  const maximumMarks = payload.max_marks ?? payload.maximum_marks ?? null;
+  const marksAwarded = payload.marks_awarded ?? payload.total_marks ?? null;
+  const remainingSeconds = payload.remaining_seconds ?? (() => {
+    const deadline = Date.parse(payload.deadline_at || "");
+    return Number.isFinite(deadline) ? Math.max(0, Math.floor((deadline - Date.now()) / 1000)) : null;
+  })();
+  return {
+    ...payload,
+    workflow_status: workflowStatus,
+    status: normalizedCodingStatus(workflowStatus),
+    evaluation_status: evaluationStatus,
+    marks_awarded: marksAwarded,
+    max_marks: maximumMarks,
+    score_percent: payload.score_percent ?? (maximumMarks > 0 && marksAwarded != null ? Math.round((marksAwarded / maximumMarks) * 10000) / 100 : null),
+    remaining_seconds: remainingSeconds,
+    breakdown,
+    answer_pdf_ready: payload.answer_pdf_ready ?? Boolean(payload.answer_pdf_url),
   };
 }
 
@@ -224,8 +298,12 @@ export const adminApi = {
 
 export const interviewApi = {
   syncMe: () => interviewApiRequest("/users/me/sync", { method: "POST" }),
-  list: () => interviewApiRequest("/interviews"),
-  get: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}`),
+  list: async () => {
+    const payload = await interviewApiRequest("/interviews");
+    const rows = Array.isArray(payload) ? payload : payload?.items || [];
+    return rows.map(normalizeInterview);
+  },
+  get: async (id) => normalizeInterview(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}`)),
   create: (payload) =>
     interviewApiRequest("/interviews/create", {
       method: "POST",
@@ -280,8 +358,11 @@ export const interviewApi = {
     method: "POST", body: JSON.stringify(payload),
   }),
   deleteOralQuestion: (id, questionId) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-questions/${encodeURIComponent(questionId)}`, { method: "DELETE" }),
-  oralRound: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round`),
+  oralRound: async (id) => normalizeOralRound(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round`)),
   startOral: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round/start`, { method: "POST" }),
+  scoreOral: (id, payload) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round/score`, {
+    method: "POST", body: JSON.stringify(payload),
+  }),
   rateOral: (id, questionId, payload) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-questions/${encodeURIComponent(questionId)}/rate`, {
     method: "POST", body: JSON.stringify(payload),
   }),
@@ -292,9 +373,11 @@ export const interviewApi = {
   }),
   deleteCodingQuestion: (id, questionId) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/questions/${encodeURIComponent(questionId)}`, { method: "DELETE" }),
   startCoding: (id, minutes) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/start`, {
-    method: "POST", body: JSON.stringify({ exam_duration_minutes: Number(minutes) }),
+    method: "POST", body: JSON.stringify({ duration_minutes: Number(minutes) }),
   }),
-  codingStatus: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/status`),
+  skipCoding: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/skip`, { method: "POST" }),
+  retryEvaluation: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/evaluate`, { method: "POST" }),
+  codingStatus: async (id) => normalizeCodingRound(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/status`)),
   notebook: (id, token) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook?token=${encodeURIComponent(token)}`),
   saveAnswer: (id, cellId, token, code) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook/cell/${encodeURIComponent(cellId)}/update`, {
     method: "POST", body: JSON.stringify({ token, code }),
@@ -346,11 +429,59 @@ export async function loadPrivateAsset(source) {
   }
 
   const response = await fetch(`${API_URL}${source}`, {
-    headers: { Authorization: `Bearer ${session.access_token}` },
+    headers: {
+      Authorization: `Bearer ${session.access_token}`,
+      Accept: "application/pdf, image/*, application/octet-stream",
+    },
   });
   if (!response.ok) {
     throw new ApiError("Could not load the private verification asset", response.status);
   }
+  const blob = await response.blob();
+  return { url: URL.createObjectURL(blob), revoke: true, contentType: blob.type };
+}
+
+export async function loadPrivateInterviewAsset(source) {
+  if (!source) return null;
+  if (!supabase) throw new ApiError("Supabase is not configured", 0, "AUTH_CONFIG");
+  const {
+    data: { session },
+    error: sessionError,
+  } = await supabase.auth.getSession();
+  if (sessionError || !session?.access_token) {
+    throw new ApiError("Please sign in with Google", 401, "AUTH_REQUIRED");
+  }
+
+  if (/^https?:\/\//i.test(source)) {
+    const sourceOrigin = new URL(source, window.location.origin).origin;
+    const apiOrigin = new URL(INTERVIEW_API_URL, window.location.origin).origin;
+    if (sourceOrigin !== apiOrigin) {
+      return { url: source, revoke: false, contentType: "application/pdf" };
+    }
+  }
+
+  let response = null;
+  for (const requestBase of localApiAlternatives(INTERVIEW_API_URL)) {
+    try {
+      const requestOrigin = new URL(requestBase || "/", window.location.origin).origin;
+      const url = /^https?:\/\//i.test(source)
+        ? source
+        : source.startsWith("/api/")
+          ? `${requestOrigin}${source}`
+          : `${requestBase}${source.startsWith("/") ? "" : "/"}${source}`;
+      response = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+          Accept: "application/pdf",
+        },
+      });
+      break;
+    } catch {
+      // Try the next local hostname, matching normal API requests.
+    }
+  }
+  if (!response) throw new ApiError("Could not reach the interview service", 0, "API_UNAVAILABLE");
+  if (!response.ok) throw new ApiError("Could not load the applicant answer PDF", response.status);
   const blob = await response.blob();
   return { url: URL.createObjectURL(blob), revoke: true, contentType: blob.type };
 }

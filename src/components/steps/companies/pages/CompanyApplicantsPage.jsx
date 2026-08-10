@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { CalendarClock, FileText, LoaderCircle, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
+import { CalendarClock, ExternalLink, FileCheck2, FileText, LoaderCircle, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import InlineCvViewer from "../../../InlineCvViewer.jsx";
+import InlineAnswerPdf from "../../../InlineAnswerPdf.jsx";
 import { companyApi, interviewApi } from "../../../../lib/api.js";
 
 
@@ -40,13 +41,11 @@ export default function CompanyApplicantsPage() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [cvApplicant, setCvApplicant] = useState(null);
+  const [answerPdfInterview, setAnswerPdfInterview] = useState(null);
   const [setupInterview, setSetupInterview] = useState(null);
-  const [oralQuestions, setOralQuestions] = useState([]);
   const [examQuestions, setExamQuestions] = useState([]);
-  const [oralForm, setOralForm] = useState({ question_text: "", expected_points: "" });
   const [examForm, setExamForm] = useState({ title: "", description: "", language: "text", starter_code: "", visible_tests: "[]", hidden_tests: "[]" });
 
-  const selectedJob = jobs.find((item) => item.id === jobId);
   const rankedApplicants = useMemo(
     () => ranking.map((rank) => ({ ...rank, applicant: applicants.find((item) => applicantRecordId(item) === applicantRecordId(rank)) })).filter((item) => item.applicant),
     [ranking, applicants],
@@ -55,7 +54,9 @@ export default function CompanyApplicantsPage() {
   const loadInterviews = async () => {
     try {
       await interviewApi.syncMe();
-      setInterviews(await interviewApi.list());
+      const rows = await interviewApi.list();
+      const assessments = await Promise.all(rows.map((item) => interviewApi.codingStatus(item.id).catch(() => null)));
+      setInterviews(rows.map((item, index) => ({ ...item, assessment: assessments[index] })));
     } catch {
       setInterviews([]);
     }
@@ -122,26 +123,8 @@ export default function CompanyApplicantsPage() {
     setSetupInterview({ ...item, candidate_name: applicant.name || applicant.email });
     setError("");
     try {
-      const [oral, exam] = await Promise.all([interviewApi.oralQuestions(item.id), interviewApi.codingQuestions(item.id)]);
-      setOralQuestions(oral); setExamQuestions(exam);
+      setExamQuestions(await interviewApi.codingQuestions(item.id));
     } catch (reason) { setError(reason.message || "Could not load the interview questions"); }
-  };
-
-  const addOral = async (event) => {
-    event.preventDefault(); setBusy(true); setError("");
-    try {
-      await interviewApi.createOralQuestion(setupInterview.id, {
-        title: `Viva question ${questionOrder(oralQuestions)}`,
-        question_text: oralForm.question_text,
-        category: "Viva",
-        difficulty: "Medium",
-        expected_points: oralForm.expected_points || null,
-        order_index: questionOrder(oralQuestions),
-      });
-      setOralForm({ question_text: "", expected_points: "" });
-      setOralQuestions(await interviewApi.oralQuestions(setupInterview.id));
-    } catch (reason) { setError(reason.message || "Could not add the viva question"); }
-    finally { setBusy(false); }
   };
 
   const addExam = async (event) => {
@@ -168,18 +151,19 @@ export default function CompanyApplicantsPage() {
     finally { setBusy(false); }
   };
 
-  const deleteQuestion = async (type, id) => {
+  const deleteQuestion = async (id) => {
     setBusy(true); setError("");
     try {
-      if (type === "oral") {
-        await interviewApi.deleteOralQuestion(setupInterview.id, id);
-        setOralQuestions(await interviewApi.oralQuestions(setupInterview.id));
-      } else {
-        await interviewApi.deleteCodingQuestion(setupInterview.id, id);
-        setExamQuestions(await interviewApi.codingQuestions(setupInterview.id));
-      }
+      await interviewApi.deleteCodingQuestion(setupInterview.id, id);
+      setExamQuestions(await interviewApi.codingQuestions(setupInterview.id));
     } catch (reason) { setError(reason.message || "Could not remove the question"); }
     finally { setBusy(false); }
+  };
+
+  const openInterview = (item) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set("interview_id", item.id);
+    window.location.assign(url.toString());
   };
 
   return (
@@ -211,8 +195,8 @@ export default function CompanyApplicantsPage() {
         <button className="btn btn-primary" disabled={busy}>Send {rankedApplicants.length} invitations</button>
       </form>}
 
-      <div className="admin-table-card"><table className="admin-full-table"><thead><tr><th>Applicant ID</th><th>Name</th><th>Email</th><th>Phone</th><th>Rank</th><th>Status</th><th>CV and interview</th></tr></thead><tbody>
-        {loading && <tr><td colSpan="7"><LoaderCircle className="spin" size={17} /> Loading applicants…</td></tr>}
+      <div className="admin-table-card"><table className="admin-full-table"><thead><tr><th>Applicant ID</th><th>Name</th><th>Email</th><th>Phone</th><th>Rank</th><th>Application</th><th>Interview status</th><th>CV and interview</th></tr></thead><tbody>
+        {loading && <tr><td colSpan="8"><LoaderCircle className="spin" size={17} /> Loading applicants…</td></tr>}
         {!loading && applicants.map((item) => {
           const recordId = applicantRecordId(item);
           const ranked = ranking.find((rankedItem) => applicantRecordId(rankedItem) === recordId);
@@ -221,26 +205,23 @@ export default function CompanyApplicantsPage() {
             <td><code className="applicant-record-id">{recordId}</code></td><td><strong>{item.name || "Applicant"}</strong></td><td>{item.email || "—"}</td><td>{item.phone || "—"}</td>
             <td>{ranked ? <strong>#{ranked.rank}</strong> : "—"}</td>
             <td><span className={`pill ${item.application_status === "rejected" ? "danger" : item.application_status === "interview_scheduled" ? "success" : "warn"}`}>{item.application_status.replaceAll("_", " ")}</span></td>
-            <td className="admin-row-actions"><button className="btn btn-outline admin-inline-button" onClick={() => viewCv(item)}><FileText size={14} /> View CV</button>{scheduled && <button className="btn btn-outline admin-inline-button" onClick={() => openSetup(scheduled, item)}><Plus size={14} /> Questions</button>}</td>
+            <td><div className="application-interview-cell"><span className={`pill ${scheduled?.display_status === "completed" ? "success" : scheduled?.display_status === "accepted" ? "neutral" : "warn"}`}>{scheduled?.display_status || "pending"}</span>{scheduled?.oral_score != null && <small>Oral {scheduled.oral_score} / {scheduled.oral_max_score}</small>}{scheduled?.assessment?.evaluation_status === "completed" && <small>Paper {scheduled.assessment.marks_awarded} / {scheduled.assessment.max_marks}</small>}{scheduled?.assessment?.status === "skipped" && <small>Proctoring skipped</small>}</div></td>
+            <td className="admin-row-actions"><button className="btn btn-outline admin-inline-button" onClick={() => viewCv(item)}><FileText size={14} /> View CV</button>{scheduled && <><button className="btn btn-outline admin-inline-button" onClick={() => openInterview(scheduled)}><ExternalLink size={14} /> Open interview</button>{scheduled.assessment?.status === "not_started" && <button className="btn btn-outline admin-inline-button" onClick={() => openSetup(scheduled, item)}><Plus size={14} /> Set paper</button>}{scheduled.assessment?.answer_pdf_ready && <button className="btn btn-outline admin-inline-button" onClick={() => setAnswerPdfInterview(scheduled)}><FileCheck2 size={14} /> PDF & marks</button>}</>}</td>
           </tr>;
         })}
-        {!loading && !applicants.length && <tr><td colSpan="7">No applicants for this vacancy.</td></tr>}
+        {!loading && !applicants.length && <tr><td colSpan="8">No applicants for this vacancy.</td></tr>}
       </tbody></table></div>
 
       <InlineCvViewer applicant={cvApplicant} onClose={() => setCvApplicant(null)} />
+      <InlineAnswerPdf interview={answerPdfInterview} onClose={() => setAnswerPdfInterview(null)} />
 
       {setupInterview && <section className="chart-card interview-question-setup">
-        <div className="admin-section-heading"><div><div className="chart-card-title">Interview questions · {setupInterview.candidate_name}</div><p className="admin-page-sub">The viva runs first. The proctored answer round starts only after every viva question is marked.</p></div><button className="icon-btn" onClick={() => setSetupInterview(null)}><X size={15} /></button></div>
-        <div className="interview-setup-grid">
+        <div className="admin-section-heading"><div><div className="chart-card-title">Proctored paper · {setupInterview.candidate_name}</div><p className="admin-page-sub">The oral round has no stored questions; the interviewer gives one overall mark out of 10. Add paper questions here, each worth 5 marks.</p></div><button className="icon-btn" onClick={() => setSetupInterview(null)}><X size={15} /></button></div>
+        <div className="interview-setup-grid paper-only">
           <div>
-            <h3>1. Viva questions</h3>
-            <form onSubmit={addOral}><textarea required placeholder="Question the interviewer will ask" value={oralForm.question_text} onChange={(e) => setOralForm({ ...oralForm, question_text: e.target.value })} /><input placeholder="Expected answer points (optional)" value={oralForm.expected_points} onChange={(e) => setOralForm({ ...oralForm, expected_points: e.target.value })} /><button className="btn btn-primary" disabled={busy}><Plus size={14} /> Add viva question</button></form>
-            {oralQuestions.map((question) => <div className="interview-question-row" key={question.id}><span>{question.order_index}. {question.question_text}</span><button className="icon-btn" onClick={() => deleteQuestion("oral", question.id)}><Trash2 size={13} /></button></div>)}
-          </div>
-          <div>
-            <h3>2. Proctored questions</h3>
+            <h3>Paper questions · 5 marks each</h3>
             <form onSubmit={addExam}><input required placeholder="Question title" value={examForm.title} onChange={(e) => setExamForm({ ...examForm, title: e.target.value })} /><textarea required placeholder="Full question or task" value={examForm.description} onChange={(e) => setExamForm({ ...examForm, description: e.target.value })} /><select value={examForm.language} onChange={(e) => setExamForm({ ...examForm, language: e.target.value })}><option value="text">Written answer</option><option value="python">Python coding</option></select><textarea placeholder="Starter answer or starter code (optional)" value={examForm.starter_code} onChange={(e) => setExamForm({ ...examForm, starter_code: e.target.value })} />{examForm.language === "python" && <><textarea placeholder={'Visible tests JSON, e.g. [{"input":"solve(2)","expected_output":"4"}]'} value={examForm.visible_tests} onChange={(e) => setExamForm({ ...examForm, visible_tests: e.target.value })} /><textarea placeholder="Hidden tests JSON" value={examForm.hidden_tests} onChange={(e) => setExamForm({ ...examForm, hidden_tests: e.target.value })} /></>}<button className="btn btn-primary" disabled={busy}><Plus size={14} /> Add proctored question</button></form>
-            {examQuestions.map((question) => <div className="interview-question-row" key={question.id}><span>{question.order_index}. {question.title}</span><button className="icon-btn" onClick={() => deleteQuestion("exam", question.id)}><Trash2 size={13} /></button></div>)}
+            {examQuestions.map((question) => <div className="interview-question-row" key={question.id}><span>{question.order_index}. {question.title} · 5 marks</span><button className="icon-btn" onClick={() => deleteQuestion(question.id)}><Trash2 size={13} /></button></div>)}
           </div>
         </div>
       </section>}

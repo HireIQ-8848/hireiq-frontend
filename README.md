@@ -24,3 +24,25 @@ npm run preview
 
 Only variables prefixed with `VITE_` reach browser code. Never put the
 Supabase service-role key or JaaS private key in this directory.
+
+## Deploy to Vercel
+
+Import `HireIQ-8848/hireiq` into Vercel and set the project Root Directory to
+`frontend`. Select the Vite framework preset; `vercel.json` runs
+`npm run build`, publishes `dist`, and provides the SPA fallback route.
+
+Add these variables to Vercel's Production and Preview environments:
+
+```env
+VITE_SUPABASE_URL=https://your-project-ref.supabase.co
+VITE_SUPABASE_PUBLISHABLE_KEY=your-publishable-or-anon-key
+VITE_API_URL=https://your-public-hireiq-api.example.com
+VITE_INTERVIEW_API_URL=https://your-public-hireiq-api.example.com/api/v1
+VITE_JAAS_APP_ID=your-jaas-app-id
+```
+
+After the first deployment, add the production Vercel URL to Supabase
+Authentication → URL Configuration and to the backend CORS allowlist. Frontend
+environment variables are embedded at build time, so redeploy after changing
+an API URL. Never expose the Supabase service-role key, database credentials,
+or `XAI_API_KEY` through a `VITE_` variable.
