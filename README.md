@@ -1,7 +1,7 @@
 # HireIQ frontend
 
 React 18 and Vite frontend for the HireIQ identity, recruitment, and interview
-workflows. It talks to the single FastAPI service in `../backend`.
+workflows. It talks to the separately deployed HireIQ FastAPI service.
 
 ## Run this component
 
@@ -27,8 +27,8 @@ Supabase service-role key or JaaS private key in this directory.
 
 ## Deploy to Vercel
 
-Import `HireIQ-8848/hireiq` into Vercel and set the project Root Directory to
-`frontend`. Select the Vite framework preset; `vercel.json` runs
+Import `HireIQ-8848/hireiq-frontend` into Vercel. Keep the project Root
+Directory at `./` and select the Vite framework preset; `vercel.json` runs
 `npm run build`, publishes `dist`, and provides the SPA fallback route.
 
 Add these variables to Vercel's Production and Preview environments:
