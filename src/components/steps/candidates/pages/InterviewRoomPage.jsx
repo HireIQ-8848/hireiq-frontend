@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, FileCode2, LoaderCircle, MonitorUp, PhoneOff, Play, Save, ShieldCheck, Video } from "lucide-react";
+import { CheckCircle2, Clock3, FileCode2, LoaderCircle, MonitorUp, PhoneOff, Play, Save, ShieldCheck, TimerReset, Video } from "lucide-react";
 import { interviewApi } from "../../../../lib/api.js";
+import { DEFAULT_ORAL_TIMER_SECONDS, loadOralQuestionTimers } from "../../../../lib/interviewTimers.js";
 
 
 const DEFAULT_APP_ID = import.meta.env.VITE_JAAS_APP_ID || "vpaas-magic-cookie-1fe1890c22f1421fb11848cbf09f62e7";
@@ -43,6 +44,12 @@ function clock(seconds) {
 }
 
 
+function oralQuestionRemaining(durationSeconds, endsAt, timestamp = Date.now()) {
+  if (!endsAt) return Math.max(0, Number(durationSeconds) || 0);
+  return Math.max(0, Math.ceil((endsAt - timestamp) / 1000));
+}
+
+
 export default function InterviewRoomPage({ interview, user, onLeave }) {
   const credentials = useMemo(() => invitation(interview, user), [interview, user]);
   const companyView = credentials.role === "interviewer";
@@ -55,7 +62,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const [message, setMessage] = useState("");
   const [dashboard, setDashboard] = useState(null);
   const [oral, setOral] = useState({ round: null, questions: [] });
-  const [oralScore, setOralScore] = useState({ rating_out_of_10: "", interviewer_notes: "" });
+  const [oralDrafts, setOralDrafts] = useState({});
   const [events, setEvents] = useState([]);
   const [coding, setCoding] = useState(null);
   const [notebook, setNotebook] = useState(null);
@@ -65,6 +72,10 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const [examMinutes, setExamMinutes] = useState(30);
   const [actionBusy, setActionBusy] = useState(false);
   const [proctorReady, setProctorReady] = useState(false);
+  const [meetingSharePending, setMeetingSharePending] = useState(false);
+  const [timerNow, setTimerNow] = useState(Date.now());
+  const [oralTimerDurations] = useState(() => loadOralQuestionTimers());
+  const [oralTimer, setOralTimer] = useState({ questionId: "", endsAt: 0 });
   const [precheckStatus, setPrecheckStatus] = useState({
     camera: false,
     microphone: false,
@@ -78,6 +89,10 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const saveTimers = useRef({});
   const eventCooldown = useRef({});
   const permissionPromptActive = useRef(false);
+  const screenSharedRef = useRef(false);
+  const meetingMediaReady = useRef(false);
+  const meetingMediaState = useRef({ camera: null, microphone: null });
+  const meetingShareTimeout = useRef(null);
 
   const logEvent = useCallback((type, severity = "MEDIUM", detail = "") => {
     if (companyView) return;
@@ -90,6 +105,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
   useEffect(() => () => {
     Object.values(saveTimers.current).forEach(window.clearTimeout);
+    window.clearTimeout(meetingShareTimeout.current);
     meetingApi.current?.dispose?.();
     proctorStream.current?.getTracks().forEach((track) => track.stop());
     screenStream.current?.getTracks().forEach((track) => track.stop());
@@ -117,22 +133,62 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       if (current?.meeting_jwt) options.jwt = current.meeting_jwt;
       const api = new window.JitsiMeetExternalAPI("8x8.vc", options);
       meetingApi.current = api;
-      api.addListener("videoConferenceJoined", () => {
+      const updateMeetingMedia = (kind, muted, canFlag = false) => {
+        const available = !Boolean(muted);
+        const previous = meetingMediaState.current[kind];
+        meetingMediaState.current[kind] = available;
+        setPrecheckStatus((status) => ({ ...status, [kind]: available }));
+        if (canFlag && previous === true && !available) {
+          logEvent(kind === "camera" ? "CAMERA_OFF" : "MIC_OFF", "HIGH", `Applicant turned the ${kind} off in the interview call`);
+        }
+      };
+      api.addListener("videoConferenceJoined", async () => {
         setMeetingJoined(true);
+        meetingMediaReady.current = false;
+        try {
+          const [audioMuted, videoMuted] = await Promise.all([api.isAudioMuted(), api.isVideoMuted()]);
+          updateMeetingMedia("microphone", audioMuted);
+          updateMeetingMedia("camera", videoMuted);
+        } catch { /* Jitsi will still publish mute-status events. */ }
+        window.setTimeout(() => {
+          meetingMediaReady.current = true;
+          permissionPromptActive.current = false;
+        }, 1500);
+      });
+      api.addListener("screenSharingStatusChanged", ({ on }) => {
+        const sharing = Boolean(on);
+        const previous = screenSharedRef.current;
+        const shouldFlagStop = previous && !permissionPromptActive.current;
+        screenSharedRef.current = sharing;
+        setScreenShared(sharing);
+        if (sharing || previous) {
+          setMeetingSharePending(false);
+          permissionPromptActive.current = false;
+          window.clearTimeout(meetingShareTimeout.current);
+        }
+        setPrecheckStatus((status) => ({ ...status, screenShare: sharing }));
+        setProctorReady(sharing && Boolean(document.fullscreenElement));
+        if (sharing) {
+          setMessage("Your Entire Screen is now visible to the interviewer.");
+        } else if (shouldFlagStop) {
+          logEvent("SCREEN_SHARE_STOPPED", "HIGH", "Applicant stopped sharing the screen with the interviewer");
+        }
       });
       api.addListener("audioMuteStatusChanged", ({ muted }) => {
-        setPrecheckStatus((status) => ({ ...status, microphone: !muted }));
-        if (muted) logEvent("MIC_OFF", "HIGH", "Applicant muted the microphone");
+        updateMeetingMedia("microphone", muted, meetingMediaReady.current);
       });
       api.addListener("videoMuteStatusChanged", ({ muted }) => {
-        setPrecheckStatus((status) => ({ ...status, camera: !muted }));
-        if (muted) logEvent("CAMERA_OFF", "HIGH", "Applicant turned the camera off");
+        updateMeetingMedia("camera", muted, meetingMediaReady.current);
       });
-    }).catch((reason) => setError(reason.message));
+    }).catch((reason) => {
+      permissionPromptActive.current = false;
+      setError(reason.message);
+    });
     return () => {
       cancelled = true;
       meetingApi.current?.dispose?.();
       meetingApi.current = null;
+      meetingMediaReady.current = false;
     };
   }, [joined]);
 
@@ -143,32 +199,29 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     };
     const blur = () => {
       window.setTimeout(() => {
-        if (!permissionPromptActive.current && !document.hidden && !document.hasFocus()) {
+        if (permissionPromptActive.current) return;
+        if (document.hidden) {
+          logEvent("TAB_SWITCHED", "HIGH", "Applicant left the interview tab");
+        } else if (!document.hasFocus()) {
           logEvent("APP_SWITCHED", "HIGH", "Applicant switched to another window or application");
         }
-      }, 0);
+      }, 150);
     };
+    const pagehide = () => logEvent("TAB_SWITCHED", "HIGH", "Applicant navigated away from the interview page");
     const fullscreen = () => {
       const active = Boolean(document.fullscreenElement);
       setPrecheckStatus((status) => ({ ...status, fullscreen: active }));
       if (!active) {
         setProctorReady(false);
         logEvent("FULLSCREEN_EXIT", "MEDIUM", "Applicant exited full screen");
-      } else if (screenStream.current?.getVideoTracks().some((track) => track.readyState === "live")) {
+      } else if (screenSharedRef.current) {
         setProctorReady(true);
       }
     };
-    const screenTrack = screenStream.current?.getVideoTracks()[0];
-    const stopped = () => {
-      setScreenShared(false);
-      setProctorReady(false);
-      setPrecheckStatus((status) => ({ ...status, screenShare: false }));
-      logEvent("SCREEN_SHARE_STOPPED", "HIGH", "Applicant stopped entire-screen sharing");
-    };
     document.addEventListener("visibilitychange", visibility);
     window.addEventListener("blur", blur);
+    window.addEventListener("pagehide", pagehide);
     document.addEventListener("fullscreenchange", fullscreen);
-    screenTrack?.addEventListener("ended", stopped);
 
     const cleanups = [];
     const stream = proctorStream.current;
@@ -177,21 +230,14 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       const label = kind === "video" ? "Camera" : "Microphone";
       const eventPrefix = kind === "video" ? "CAMERA" : "MIC";
       const update = (available) => setPrecheckStatus((status) => ({ ...status, [stateKey]: available }));
-      const muted = () => {
-        update(false);
-        logEvent(`${eventPrefix}_INTERRUPTED`, "HIGH", `${label} stopped providing media`);
-      };
-      const unmuted = () => update(true);
       const ended = () => {
         update(false);
-        logEvent(`${eventPrefix}_OFF`, "HIGH", `${label} permission or device was turned off`);
+        if (!permissionPromptActive.current) {
+          logEvent(`${eventPrefix}_OFF`, "HIGH", `${label} permission or device was turned off`);
+        }
       };
-      track.addEventListener("mute", muted);
-      track.addEventListener("unmute", unmuted);
       track.addEventListener("ended", ended);
       cleanups.push(() => {
-        track.removeEventListener("mute", muted);
-        track.removeEventListener("unmute", unmuted);
         track.removeEventListener("ended", ended);
       });
     };
@@ -220,11 +266,11 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     return () => {
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("blur", blur);
+      window.removeEventListener("pagehide", pagehide);
       document.removeEventListener("fullscreenchange", fullscreen);
-      screenTrack?.removeEventListener("ended", stopped);
       cleanups.forEach((cleanup) => cleanup());
     };
-  }, [coding?.status, companyView, joined, logEvent, screenShared]);
+  }, [coding?.status, companyView, joined, logEvent]);
 
   const poll = useCallback(async () => {
     try {
@@ -238,13 +284,25 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
           interviewApi.codingStatus(interview.id),
         ]);
         setDashboard(nextDashboard); setOral(nextOral); setEvents(nextEvents); setCoding(nextCoding);
-        setOralScore((draft) => ({
-          rating_out_of_10: draft.rating_out_of_10 === "" ? (nextOral.round?.average_rating ?? "") : draft.rating_out_of_10,
-          interviewer_notes: draft.interviewer_notes || nextOral.round?.interviewer_notes || "",
-        }));
+        setOralDrafts((drafts) => {
+          const nextDrafts = { ...drafts };
+          nextOral.questions.forEach((question) => {
+            if (!nextDrafts[question.id]) {
+              nextDrafts[question.id] = {
+                rating_out_of_10: question.rating_out_of_10 ?? "",
+                interviewer_notes: question.interviewer_notes || "",
+              };
+            }
+          });
+          return nextDrafts;
+        });
       } else {
-        const nextCoding = await interviewApi.codingStatus(interview.id);
+        const [nextCoding, nextOral] = await Promise.all([
+          interviewApi.codingStatus(interview.id),
+          interviewApi.oralRound(interview.id),
+        ]);
         setCoding(nextCoding);
+        setOral(nextOral);
         if (nextCoding.status === "active") {
           const nextNotebook = await interviewApi.notebook(interview.id, credentials.token);
           setNotebook(nextNotebook);
@@ -267,6 +325,13 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     const timer = window.setInterval(poll, 1500);
     return () => window.clearInterval(timer);
   }, [joined, poll]);
+
+  useEffect(() => {
+    if (!joined || (oral.round?.status !== "active" && coding?.status !== "active")) return undefined;
+    setTimerNow(Date.now());
+    const timer = window.setInterval(() => setTimerNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [coding?.status, joined, oral.round?.status]);
 
   const companyEnter = async () => {
     setJoining(true); setError("");
@@ -331,11 +396,9 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       screenStream.current?.getTracks().forEach((track) => track.stop());
       screenStream.current = stream;
       screenTrack.addEventListener("ended", () => {
-        setScreenShared(false);
         setProctorReady(false);
         setPrecheckStatus((status) => ({ ...status, screenShare: false }));
       }, { once: true });
-      setScreenShared(true);
       setPrecheckStatus((status) => ({ ...status, screenShare: true }));
       return stream;
     } finally {
@@ -350,7 +413,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
         throw new Error("Enable your camera and microphone first.");
       }
       await captureEntireScreen();
-      setMessage("Entire screen sharing is active. Enter full screen to finish the pre-check.");
+      setMessage("Entire Screen permission is verified. Enter full screen to finish the pre-check.");
     } catch (reason) {
       setError(reason.message || "Could not share the entire screen");
     } finally { setJoining(false); }
@@ -358,6 +421,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
   const candidateEnter = async () => {
     setJoining(true); setError(""); setMessage("");
+    let joinedSuccessfully = false;
     try {
       const camera = proctorStream.current?.getVideoTracks().some((track) => track.readyState === "live") || false;
       const microphone = proctorStream.current?.getAudioTracks().some((track) => track.readyState === "live") || false;
@@ -383,12 +447,16 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       if (result?.status !== "passed") throw new Error("The applicant pre-check did not pass. Please confirm every permission and try again.");
       await interviewApi.join(interview.id, credentials.role, credentials.token);
       setCurrent(await interviewApi.get(interview.id));
-      setProctorReady(true);
+      setProctorReady(false);
+      setScreenShared(false);
+      screenSharedRef.current = false;
+      permissionPromptActive.current = true;
+      joinedSuccessfully = true;
       setJoined(true);
     } catch (reason) {
       setError(reason.message || "Could not complete the applicant pre-check");
     } finally {
-      permissionPromptActive.current = false;
+      if (!joinedSuccessfully) permissionPromptActive.current = false;
       setJoining(false);
     }
   };
@@ -405,28 +473,97 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     await interviewApi.startOral(interview.id);
   }, "Viva started.");
 
-  const saveMark = () => perform(() => interviewApi.scoreOral(interview.id, {
-    score: Number(oralScore.rating_out_of_10),
-    notes: oralScore.interviewer_notes || null,
-  }), "Mark saved.");
+  const updateOralDraft = (questionId, field, value) => {
+    setOralDrafts((drafts) => ({
+      ...drafts,
+      [questionId]: {
+        rating_out_of_10: drafts[questionId]?.rating_out_of_10 ?? "",
+        interviewer_notes: drafts[questionId]?.interviewer_notes || "",
+        [field]: value,
+      },
+    }));
+  };
 
-  const endViva = () => perform(() => interviewApi.endOral(interview.id), "Viva completed. The proctored round is ready.");
+  const saveQuestionMark = (question) => perform(() => {
+    const draft = oralDrafts[question.id] || {};
+    if (draft.rating_out_of_10 === "" || draft.rating_out_of_10 == null) {
+      throw new Error(`Enter a mark for ${question.title}.`);
+    }
+    return interviewApi.rateOral(interview.id, question.id, {
+      rating_out_of_10: Number(draft.rating_out_of_10),
+      interviewer_notes: draft.interviewer_notes || null,
+    });
+  }, `${question.title} marked.`);
+
+  const startQuestionTimer = (question) => {
+    const duration = Number(oralTimerDurations[question.id] || DEFAULT_ORAL_TIMER_SECONDS);
+    setTimerNow(Date.now());
+    setOralTimer({ questionId: question.id, endsAt: Date.now() + duration * 1000 });
+    setMessage(`${question.title} countdown started.`);
+    setError("");
+  };
+
+  const endViva = () => perform(async () => {
+    const missing = oral.questions.filter((question) => {
+      const draft = oralDrafts[question.id];
+      return question.rating_out_of_10 == null && (draft?.rating_out_of_10 === "" || draft?.rating_out_of_10 == null);
+    });
+    if (missing.length) throw new Error(`Enter a mark for every oral question first (${missing.length} remaining).`);
+    await Promise.all(oral.questions.map((question) => {
+      const draft = oralDrafts[question.id];
+      if (!draft || draft.rating_out_of_10 === "" || draft.rating_out_of_10 == null) return Promise.resolve();
+      const unchanged = Number(draft.rating_out_of_10) === Number(question.rating_out_of_10)
+        && (draft.interviewer_notes || "") === (question.interviewer_notes || "");
+      return unchanged ? Promise.resolve() : interviewApi.rateOral(interview.id, question.id, {
+        rating_out_of_10: Number(draft.rating_out_of_10),
+        interviewer_notes: draft.interviewer_notes || null,
+      });
+    }));
+    await interviewApi.endOral(interview.id);
+  }, "Viva completed. The proctored round is ready.");
   const startExam = () => perform(() => interviewApi.startCoding(interview.id, examMinutes), "Proctored answer round started.");
   const skipExam = () => perform(() => interviewApi.skipCoding(interview.id), "Proctored round skipped. The interview is complete.");
+
+  const shareScreenWithInterviewer = async () => {
+    setActionBusy(true); setError(""); setMessage("");
+    try {
+      if (!meetingJoined || !meetingApi.current) throw new Error("Wait for the interview call to connect before sharing your screen.");
+      if (screenSharedRef.current) return;
+      permissionPromptActive.current = true;
+      setMeetingSharePending(true);
+      screenStream.current?.getTracks().forEach((track) => track.stop());
+      screenStream.current = null;
+      setPrecheckStatus((status) => ({ ...status, screenShare: false }));
+      meetingApi.current.executeCommand("toggleShareScreen");
+      setMessage("In the browser prompt, choose Entire Screen to make it visible to the interviewer.");
+      window.clearTimeout(meetingShareTimeout.current);
+      meetingShareTimeout.current = window.setTimeout(() => {
+        if (!screenSharedRef.current) {
+          setMeetingSharePending(false);
+          permissionPromptActive.current = false;
+          setError("Screen sharing did not start. Click Share Entire Screen and approve the browser prompt.");
+        }
+      }, 12000);
+    } catch (reason) {
+      setMeetingSharePending(false);
+      permissionPromptActive.current = false;
+      setError(reason.message || "Could not share the screen with the interviewer");
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   const enterProctoredWorkspace = async () => {
     setActionBusy(true); setError("");
     try {
-      const hasLiveScreen = screenStream.current?.getVideoTracks().some((track) => track.readyState === "live");
-      if (!hasLiveScreen) await captureEntireScreen();
+      if (!screenSharedRef.current) throw new Error("Share your Entire Screen with the interviewer first.");
       if (!document.fullscreenElement) {
         permissionPromptActive.current = true;
         await document.documentElement.requestFullscreen();
       }
-      setScreenShared(true);
       setProctorReady(true);
       setPrecheckStatus((status) => ({ ...status, screenShare: true, fullscreen: true }));
-      logEvent("PROCTORED_WORKSPACE_ENTERED", "LOW", "Entire-screen sharing and full screen enabled");
+      logEvent("PROCTORED_WORKSPACE_ENTERED", "LOW", "In-call Entire Screen sharing and full screen enabled");
     } catch (reason) {
       setError(reason.message || "Could not enter the proctored workspace");
     } finally {
@@ -458,6 +595,8 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   };
 
   const leave = () => {
+    permissionPromptActive.current = true;
+    window.clearTimeout(meetingShareTimeout.current);
     meetingApi.current?.dispose?.();
     proctorStream.current?.getTracks().forEach((track) => track.stop());
     screenStream.current?.getTracks().forEach((track) => track.stop());
@@ -466,12 +605,12 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   };
 
   const examActive = coding?.status === "active";
-  const oralMarked = oral.round?.average_rating != null;
   const activeCell = notebook?.cells.find((cell) => cell.cell_id === activeCellId) || notebook?.cells[0];
+  const monitoringActive = precheckStatus.camera && precheckStatus.microphone && screenShared;
 
   return <div className={`video-room ${examActive && !companyView ? "proctored-mode" : ""}`}>
     <div className="video-room-header">
-      <span className="video-room-title">{current.candidate_name && companyView ? `${current.candidate_name} · ` : ""}{current.job_id || "HireIQ Interview"}{joined && !companyView && <small className={precheckStatus.camera && precheckStatus.microphone && precheckStatus.screenShare ? "monitoring-active" : "monitoring-warning"}>{precheckStatus.camera && precheckStatus.microphone && precheckStatus.screenShare ? "Monitoring active" : "Monitoring interrupted"}</small>}</span>
+      <span className="video-room-title">{current.candidate_name && companyView ? `${current.candidate_name} · ` : ""}{current.job_id || "HireIQ Interview"}{joined && !companyView && <small className={monitoringActive ? "monitoring-active" : "monitoring-warning"}>{monitoringActive ? "Monitoring active" : "Monitoring interrupted"}</small>}</span>
       <span className="video-room-timer">{examActive ? clock(coding.remaining_seconds) : (meetingJoined ? "Connected" : current.scheduling_status)}</span>
     </div>
     {error && <div className="interview-room-alert" role="alert">{error}</div>}
@@ -479,15 +618,15 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
     {!joined ? <div className="interview-prejoin-card">
       <Video size={32} color="var(--primary)" /><h2>{companyView ? "Ready to join?" : "Applicant device pre-check"}</h2>
-      <p>{companyView ? "Your company invitation will be verified before entry." : "Complete all three steps. Your browser will ask for camera, microphone, Entire Screen sharing, and full-screen access before the interview opens."}</p>
+      <p>{companyView ? "Your company invitation will be verified before entry." : "Complete all three checks. The screen check verifies Entire Screen permission; after the call connects, one final prompt publishes it to the interviewer."}</p>
       {!companyView && <div className="precheck-list" aria-label="Applicant pre-check status">
         <div className={precheckStatus.camera ? "passed" : ""}><CheckCircle2 size={17} /><span>Camera</span><strong>{precheckStatus.camera ? "Ready" : "Required"}</strong></div>
         <div className={precheckStatus.microphone ? "passed" : ""}><CheckCircle2 size={17} /><span>Microphone</span><strong>{precheckStatus.microphone ? "Ready" : "Required"}</strong></div>
-        <div className={precheckStatus.screenShare ? "passed" : ""}><CheckCircle2 size={17} /><span>Entire Screen</span><strong>{precheckStatus.screenShare ? "Sharing" : "Required"}</strong></div>
+        <div className={precheckStatus.screenShare ? "passed" : ""}><CheckCircle2 size={17} /><span>Entire Screen</span><strong>{precheckStatus.screenShare ? "Verified" : "Required"}</strong></div>
       </div>}
       {companyView ? <div className="portal-heading-actions"><button className="btn btn-primary" onClick={companyEnter} disabled={joining}>{joining ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />} Verify & Join</button><button className="btn btn-outline" onClick={leave}>Cancel</button></div> : <div className="precheck-actions">
         <button className="btn btn-outline" onClick={enableCameraAndMicrophone} disabled={joining}>{precheckStatus.camera && precheckStatus.microphone ? <CheckCircle2 size={15} /> : <Video size={15} />} 1. Enable camera & microphone</button>
-        <button className="btn btn-outline" onClick={shareEntireScreen} disabled={joining || !precheckStatus.camera || !precheckStatus.microphone}>{precheckStatus.screenShare ? <CheckCircle2 size={15} /> : <MonitorUp size={15} />} 2. Share Entire Screen</button>
+        <button className="btn btn-outline" onClick={shareEntireScreen} disabled={joining || !precheckStatus.camera || !precheckStatus.microphone}>{precheckStatus.screenShare ? <CheckCircle2 size={15} /> : <MonitorUp size={15} />} 2. Verify Entire Screen</button>
         <button className="btn btn-primary" onClick={candidateEnter} disabled={joining || !precheckStatus.camera || !precheckStatus.microphone || !precheckStatus.screenShare}>{joining ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />} 3. Enter full screen & join</button>
         <button className="btn btn-outline" onClick={leave}>Cancel</button>
       </div>}
@@ -502,14 +641,25 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
           <div className="interview-state-row"><span>Stage</span><strong>{coding?.status === "active" ? "Proctored exam" : coding?.status === "skipped" ? "Proctoring skipped" : coding?.status === "completed" ? "Evaluation" : oral.round?.status === "active" ? "Oral round" : oral.round?.status === "completed" ? "Oral completed" : "Waiting"}</strong></div>
 
           {oral.round?.status === "not_started" && <button className="btn btn-primary" disabled={actionBusy} onClick={startViva}><Play size={14} /> Start oral round</button>}
-          {oral.round?.status === "active" && <section className="viva-score-card">
-            <strong>Overall oral assessment</strong>
-            <small>No oral questions are stored. Enter one overall interviewer mark.</small>
-            <label>Applicant mark out of 10<input type="number" min="0" max="10" step="0.5" value={oralScore.rating_out_of_10} onChange={(event) => setOralScore({ ...oralScore, rating_out_of_10: event.target.value })} /></label>
-            <label>Interviewer notes<textarea value={oralScore.interviewer_notes} onChange={(event) => setOralScore({ ...oralScore, interviewer_notes: event.target.value })} /></label>
-            <button className="btn btn-outline" disabled={actionBusy || oralScore.rating_out_of_10 === ""} onClick={saveMark}><Save size={13} /> Save oral mark</button>
-          </section>}
-          {oral.round?.status === "active" && <button className="btn btn-primary" disabled={!oralMarked || actionBusy} onClick={endViva}><CheckCircle2 size={14} /> Complete oral round</button>}
+          {oral.round?.status === "active" && <div className="oral-question-controls">
+            <div className="oral-round-progress"><strong>Oral questions</strong><span>{oral.round.rated_questions || 0} / {oral.round.total_questions || oral.questions.length} marked</span></div>
+            {oral.questions.map((question, index) => {
+              const draft = oralDrafts[question.id] || { rating_out_of_10: question.rating_out_of_10 ?? "", interviewer_notes: question.interviewer_notes || "" };
+              const duration = Number(oralTimerDurations[question.id] || DEFAULT_ORAL_TIMER_SECONDS);
+              const timerStarted = oralTimer.questionId === question.id;
+              const remaining = oralQuestionRemaining(duration, timerStarted ? oralTimer.endsAt : 0, timerNow);
+              return <section className={`viva-score-card ${question.status === "rated" ? "rated" : ""}`} key={question.id}>
+                <div className="viva-question-heading"><strong>Q{index + 1}. {question.title}</strong><span className={timerStarted && remaining === 0 ? "expired" : ""}><Clock3 size={12} /> {clock(remaining)}</span></div>
+                <p>{question.question_text}</p>
+                {question.expected_points && <details><summary>Expected points</summary><small>{question.expected_points}</small></details>}
+                <button className="btn btn-outline oral-timer-button" disabled={actionBusy} onClick={() => startQuestionTimer(question)}><TimerReset size={13} /> {timerStarted ? "Restart" : "Start"} {clock(duration)} timer</button>
+                <label>Applicant mark out of 10<input type="number" min="0" max="10" step="0.5" value={draft.rating_out_of_10} onChange={(event) => updateOralDraft(question.id, "rating_out_of_10", event.target.value)} /></label>
+                <label>Interviewer notes<textarea value={draft.interviewer_notes} onChange={(event) => updateOralDraft(question.id, "interviewer_notes", event.target.value)} /></label>
+                <button className="btn btn-outline" disabled={actionBusy || draft.rating_out_of_10 === ""} onClick={() => saveQuestionMark(question)}><Save size={13} /> {question.status === "rated" ? "Update mark" : "Save mark"}</button>
+              </section>;
+            })}
+          </div>}
+          {oral.round?.status === "active" && <button className="btn btn-primary" disabled={actionBusy} onClick={endViva}><CheckCircle2 size={14} /> Complete oral round</button>}
           {oral.round?.status === "completed" && coding?.status === "not_started" && <div className="start-proctored-box">
             <strong>Choose the next step</strong>
             <p>Set the paper duration before starting, or finish the interview without showing an answer page to the applicant.</p>
@@ -528,8 +678,17 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
         </aside>}
       </div>
 
+      {!companyView && meetingJoined && !screenShared && <section className="meeting-share-overlay" role="dialog" aria-modal="true" aria-labelledby="meeting-share-title">
+        <div className="meeting-share-card">
+          <MonitorUp size={38} />
+          <h2 id="meeting-share-title">Share your screen with the interviewer</h2>
+          <p>The pre-check verified screen permission. One final browser prompt connects your Entire Screen to the live interview so the interviewer can actually see it.</p>
+          <button className="btn btn-primary" disabled={actionBusy || meetingSharePending} onClick={shareScreenWithInterviewer}>{meetingSharePending ? <LoaderCircle className="spin" size={15} /> : <MonitorUp size={15} />} {meetingSharePending ? "Waiting for browser approval…" : "Share Entire Screen"}</button>
+        </div>
+      </section>}
+
       {!companyView && examActive && <section className="proctored-answer-page">
-        {!proctorReady ? <div className="proctor-permission-card"><ShieldCheck size={36} /><h2>Enter the secure answer workspace</h2><p>The timer is running. Share your Entire Screen and enter full screen to open the paper. The video call will continue securely in the background.</p><button className="btn btn-primary" disabled={actionBusy} onClick={enterProctoredWorkspace}><MonitorUp size={15} /> Share entire screen & continue</button></div> : <>
+        {!proctorReady ? <div className="proctor-permission-card"><ShieldCheck size={36} /><h2>Enter the secure answer workspace</h2><p>The timer is running. Keep your Entire Screen shared with the interviewer and enter full screen to open the paper. The video call will continue securely in the background.</p>{screenShared ? <button className="btn btn-primary" disabled={actionBusy} onClick={enterProctoredWorkspace}><MonitorUp size={15} /> Enter full screen & continue</button> : <button className="btn btn-primary" disabled={actionBusy || meetingSharePending} onClick={shareScreenWithInterviewer}><MonitorUp size={15} /> Share Entire Screen</button>}</div> : <>
           <header><div><h1><FileCode2 size={20} /> HireIQ Paper</h1><p>Autosaved · each question carries 5 marks · Grok evaluates the submitted PDF.</p></div><div className="proctored-header-actions"><span>{clock(coding.remaining_seconds)}</span>{!screenShared && <button className="btn btn-outline" onClick={enterProctoredWorkspace}><MonitorUp size={14} /> Resume screen share</button>}<button className="btn btn-primary" disabled={actionBusy || !notebook} onClick={submitExam}>Submit paper</button></div></header>
           <div className="proctored-workbench">
             <aside className="paper-explorer"><strong>EXPLORER</strong><span>QUESTIONS</span>{notebook?.cells.map((cell, index) => <button className={cell.cell_id === activeCell?.cell_id ? "active" : ""} key={cell.cell_id} onClick={() => setActiveCellId(cell.cell_id)}><FileCode2 size={13} /> Q{index + 1} · {cell.title}</button>)}</aside>

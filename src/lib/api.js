@@ -360,9 +360,6 @@ export const interviewApi = {
   deleteOralQuestion: (id, questionId) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-questions/${encodeURIComponent(questionId)}`, { method: "DELETE" }),
   oralRound: async (id) => normalizeOralRound(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round`)),
   startOral: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round/start`, { method: "POST" }),
-  scoreOral: (id, payload) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-round/score`, {
-    method: "POST", body: JSON.stringify(payload),
-  }),
   rateOral: (id, questionId, payload) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/oral-questions/${encodeURIComponent(questionId)}/rate`, {
     method: "POST", body: JSON.stringify(payload),
   }),
@@ -373,7 +370,7 @@ export const interviewApi = {
   }),
   deleteCodingQuestion: (id, questionId) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/questions/${encodeURIComponent(questionId)}`, { method: "DELETE" }),
   startCoding: (id, minutes) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/start`, {
-    method: "POST", body: JSON.stringify({ duration_minutes: Number(minutes) }),
+    method: "POST", body: JSON.stringify({ exam_duration_minutes: Number(minutes) }),
   }),
   skipCoding: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/skip`, { method: "POST" }),
   retryEvaluation: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/evaluate`, { method: "POST" }),

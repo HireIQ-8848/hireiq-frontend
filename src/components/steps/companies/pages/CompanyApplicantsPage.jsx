@@ -3,6 +3,7 @@ import { CalendarClock, ExternalLink, FileCheck2, FileText, LoaderCircle, Plus, 
 import InlineCvViewer from "../../../InlineCvViewer.jsx";
 import InlineAnswerPdf from "../../../InlineAnswerPdf.jsx";
 import { companyApi, interviewApi } from "../../../../lib/api.js";
+import { DEFAULT_ORAL_TIMER_SECONDS, loadOralQuestionTimers, removeOralQuestionTimer, saveOralQuestionTimer } from "../../../../lib/interviewTimers.js";
 
 
 const INITIAL_SCHEDULE = {
@@ -43,7 +44,10 @@ export default function CompanyApplicantsPage() {
   const [cvApplicant, setCvApplicant] = useState(null);
   const [answerPdfInterview, setAnswerPdfInterview] = useState(null);
   const [setupInterview, setSetupInterview] = useState(null);
+  const [oralQuestions, setOralQuestions] = useState([]);
+  const [oralTimerSeconds, setOralTimerSeconds] = useState(() => loadOralQuestionTimers());
   const [examQuestions, setExamQuestions] = useState([]);
+  const [oralForm, setOralForm] = useState({ title: "", question_text: "", expected_points: "", timer_minutes: 2 });
   const [examForm, setExamForm] = useState({ title: "", description: "", language: "text", starter_code: "", visible_tests: "[]", hidden_tests: "[]" });
 
   const rankedApplicants = useMemo(
@@ -123,8 +127,32 @@ export default function CompanyApplicantsPage() {
     setSetupInterview({ ...item, candidate_name: applicant.name || applicant.email });
     setError("");
     try {
-      setExamQuestions(await interviewApi.codingQuestions(item.id));
+      const [nextOralQuestions, nextExamQuestions] = await Promise.all([
+        interviewApi.oralQuestions(item.id),
+        interviewApi.codingQuestions(item.id),
+      ]);
+      setOralQuestions(nextOralQuestions);
+      setExamQuestions(nextExamQuestions);
+      setOralTimerSeconds(loadOralQuestionTimers());
     } catch (reason) { setError(reason.message || "Could not load the interview questions"); }
+  };
+
+  const addOral = async (event) => {
+    event.preventDefault(); setBusy(true); setError("");
+    try {
+      const created = await interviewApi.createOralQuestion(setupInterview.id, {
+        title: oralForm.title,
+        question_text: oralForm.question_text,
+        category: "Viva",
+        difficulty: "Medium",
+        expected_points: oralForm.expected_points || null,
+        order_index: questionOrder(oralQuestions),
+      });
+      setOralTimerSeconds(saveOralQuestionTimer(created.id, Number(oralForm.timer_minutes) * 60));
+      setOralForm({ title: "", question_text: "", expected_points: "", timer_minutes: 2 });
+      setOralQuestions(await interviewApi.oralQuestions(setupInterview.id));
+    } catch (reason) { setError(reason.message || "Could not add the oral question"); }
+    finally { setBusy(false); }
   };
 
   const addExam = async (event) => {
@@ -157,6 +185,16 @@ export default function CompanyApplicantsPage() {
       await interviewApi.deleteCodingQuestion(setupInterview.id, id);
       setExamQuestions(await interviewApi.codingQuestions(setupInterview.id));
     } catch (reason) { setError(reason.message || "Could not remove the question"); }
+    finally { setBusy(false); }
+  };
+
+  const deleteOralQuestion = async (id) => {
+    setBusy(true); setError("");
+    try {
+      await interviewApi.deleteOralQuestion(setupInterview.id, id);
+      setOralTimerSeconds(removeOralQuestionTimer(id));
+      setOralQuestions(await interviewApi.oralQuestions(setupInterview.id));
+    } catch (reason) { setError(reason.message || "Could not remove the oral question"); }
     finally { setBusy(false); }
   };
 
@@ -206,7 +244,7 @@ export default function CompanyApplicantsPage() {
             <td>{ranked ? <strong>#{ranked.rank}</strong> : "—"}</td>
             <td><span className={`pill ${item.application_status === "rejected" ? "danger" : item.application_status === "interview_scheduled" ? "success" : "warn"}`}>{item.application_status.replaceAll("_", " ")}</span></td>
             <td><div className="application-interview-cell"><span className={`pill ${scheduled?.display_status === "completed" ? "success" : scheduled?.display_status === "accepted" ? "neutral" : "warn"}`}>{scheduled?.display_status || "pending"}</span>{scheduled?.oral_score != null && <small>Oral {scheduled.oral_score} / {scheduled.oral_max_score}</small>}{scheduled?.assessment?.evaluation_status === "completed" && <small>Paper {scheduled.assessment.marks_awarded} / {scheduled.assessment.max_marks}</small>}{scheduled?.assessment?.status === "skipped" && <small>Proctoring skipped</small>}</div></td>
-            <td className="admin-row-actions"><button className="btn btn-outline admin-inline-button" onClick={() => viewCv(item)}><FileText size={14} /> View CV</button>{scheduled && <><button className="btn btn-outline admin-inline-button" onClick={() => openInterview(scheduled)}><ExternalLink size={14} /> Open interview</button>{scheduled.assessment?.status === "not_started" && <button className="btn btn-outline admin-inline-button" onClick={() => openSetup(scheduled, item)}><Plus size={14} /> Set paper</button>}{scheduled.assessment?.answer_pdf_ready && <button className="btn btn-outline admin-inline-button" onClick={() => setAnswerPdfInterview(scheduled)}><FileCheck2 size={14} /> PDF & marks</button>}</>}</td>
+            <td className="admin-row-actions"><button className="btn btn-outline admin-inline-button" onClick={() => viewCv(item)}><FileText size={14} /> View CV</button>{scheduled && <><button className="btn btn-outline admin-inline-button" onClick={() => openInterview(scheduled)}><ExternalLink size={14} /> Open interview</button>{scheduled.assessment?.status === "not_started" && <button className="btn btn-outline admin-inline-button" onClick={() => openSetup(scheduled, item)}><Plus size={14} /> Set questions</button>}{scheduled.assessment?.answer_pdf_ready && <button className="btn btn-outline admin-inline-button" onClick={() => setAnswerPdfInterview(scheduled)}><FileCheck2 size={14} /> PDF & marks</button>}</>}</td>
           </tr>;
         })}
         {!loading && !applicants.length && <tr><td colSpan="8">No applicants for this vacancy.</td></tr>}
@@ -216,8 +254,19 @@ export default function CompanyApplicantsPage() {
       <InlineAnswerPdf interview={answerPdfInterview} onClose={() => setAnswerPdfInterview(null)} />
 
       {setupInterview && <section className="chart-card interview-question-setup">
-        <div className="admin-section-heading"><div><div className="chart-card-title">Proctored paper · {setupInterview.candidate_name}</div><p className="admin-page-sub">The oral round has no stored questions; the interviewer gives one overall mark out of 10. Add paper questions here, each worth 5 marks.</p></div><button className="icon-btn" onClick={() => setSetupInterview(null)}><X size={15} /></button></div>
-        <div className="interview-setup-grid paper-only">
+        <div className="admin-section-heading"><div><div className="chart-card-title">Interview questions · {setupInterview.candidate_name}</div><p className="admin-page-sub">Add timed oral questions and proctored paper questions before the interview begins.</p></div><button className="icon-btn" onClick={() => setSetupInterview(null)}><X size={15} /></button></div>
+        <div className="interview-setup-grid">
+          <div>
+            <h3>Oral questions · marked out of 10</h3>
+            <form onSubmit={addOral}>
+              <input required placeholder="Question title" value={oralForm.title} onChange={(event) => setOralForm({ ...oralForm, title: event.target.value })} />
+              <textarea required placeholder="Question to show during the oral round" value={oralForm.question_text} onChange={(event) => setOralForm({ ...oralForm, question_text: event.target.value })} />
+              <textarea placeholder="Expected answer points (interviewer only)" value={oralForm.expected_points} onChange={(event) => setOralForm({ ...oralForm, expected_points: event.target.value })} />
+              <label className="interview-timer-field">Answer timer on this interviewer device (minutes)<input required type="number" min="0.17" max="120" step="0.5" value={oralForm.timer_minutes} onChange={(event) => setOralForm({ ...oralForm, timer_minutes: event.target.value })} /></label>
+              <button className="btn btn-primary" disabled={busy}><Plus size={14} /> Add timed oral question</button>
+            </form>
+            {oralQuestions.map((question) => <div className="interview-question-row" key={question.id}><span>{question.order_index}. {question.title}<small>{Math.ceil(Number(oralTimerSeconds[question.id] || DEFAULT_ORAL_TIMER_SECONDS) / 60)} min countdown</small></span><button className="icon-btn" onClick={() => deleteOralQuestion(question.id)}><Trash2 size={13} /></button></div>)}
+          </div>
           <div>
             <h3>Paper questions · 5 marks each</h3>
             <form onSubmit={addExam}><input required placeholder="Question title" value={examForm.title} onChange={(e) => setExamForm({ ...examForm, title: e.target.value })} /><textarea required placeholder="Full question or task" value={examForm.description} onChange={(e) => setExamForm({ ...examForm, description: e.target.value })} /><select value={examForm.language} onChange={(e) => setExamForm({ ...examForm, language: e.target.value })}><option value="text">Written answer</option><option value="python">Python coding</option></select><textarea placeholder="Starter answer or starter code (optional)" value={examForm.starter_code} onChange={(e) => setExamForm({ ...examForm, starter_code: e.target.value })} />{examForm.language === "python" && <><textarea placeholder={'Visible tests JSON, e.g. [{"input":"solve(2)","expected_output":"4"}]'} value={examForm.visible_tests} onChange={(e) => setExamForm({ ...examForm, visible_tests: e.target.value })} /><textarea placeholder="Hidden tests JSON" value={examForm.hidden_tests} onChange={(e) => setExamForm({ ...examForm, hidden_tests: e.target.value })} /></>}<button className="btn btn-primary" disabled={busy}><Plus size={14} /> Add proctored question</button></form>
