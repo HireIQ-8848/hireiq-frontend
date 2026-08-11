@@ -65,12 +65,19 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const [examMinutes, setExamMinutes] = useState(30);
   const [actionBusy, setActionBusy] = useState(false);
   const [proctorReady, setProctorReady] = useState(false);
+  const [precheckStatus, setPrecheckStatus] = useState({
+    camera: false,
+    microphone: false,
+    screenShare: false,
+    fullscreen: false,
+  });
   const meetNode = useRef(null);
   const meetingApi = useRef(null);
   const proctorStream = useRef(null);
   const screenStream = useRef(null);
   const saveTimers = useRef({});
   const eventCooldown = useRef({});
+  const permissionPromptActive = useRef(false);
 
   const logEvent = useCallback((type, severity = "MEDIUM", detail = "") => {
     if (companyView) return;
@@ -78,7 +85,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     const now = Date.now();
     if (eventCooldown.current[key] && now - eventCooldown.current[key] < 4000) return;
     eventCooldown.current[key] = now;
-    void interviewApi.proctorEvent(interview.id, type, severity, { detail });
+    void interviewApi.proctorEvent(interview.id, type, severity, { detail }).catch(() => {});
   }, [companyView, interview.id]);
 
   useEffect(() => () => {
@@ -113,12 +120,14 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       api.addListener("videoConferenceJoined", () => {
         setMeetingJoined(true);
       });
-      api.addListener("screenSharingStatusChanged", ({ on }) => {
-        setScreenShared(Boolean(on));
-        if (!on && !companyView) logEvent("SCREEN_SHARE_STOPPED", "HIGH", "Applicant stopped meeting screen sharing");
+      api.addListener("audioMuteStatusChanged", ({ muted }) => {
+        setPrecheckStatus((status) => ({ ...status, microphone: !muted }));
+        if (muted) logEvent("MIC_OFF", "HIGH", "Applicant muted the microphone");
       });
-      api.addListener("audioMuteStatusChanged", ({ muted }) => { if (muted) logEvent("MIC_OFF", "HIGH", "Applicant muted the microphone"); });
-      api.addListener("videoMuteStatusChanged", ({ muted }) => { if (muted) logEvent("CAMERA_OFF", "HIGH", "Applicant turned the camera off"); });
+      api.addListener("videoMuteStatusChanged", ({ muted }) => {
+        setPrecheckStatus((status) => ({ ...status, camera: !muted }));
+        if (muted) logEvent("CAMERA_OFF", "HIGH", "Applicant turned the camera off");
+      });
     }).catch((reason) => setError(reason.message));
     return () => {
       cancelled = true;
@@ -128,12 +137,34 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   }, [joined]);
 
   useEffect(() => {
-    if (!joined || companyView || coding?.status !== "active" || !proctorReady) return undefined;
-    const visibility = () => { if (document.hidden) logEvent("TAB_SWITCHED", "HIGH", "Applicant left the interview tab"); };
-    const blur = () => logEvent("WINDOW_BLUR", "MEDIUM", "Interview window lost focus");
-    const fullscreen = () => { if (!document.fullscreenElement) logEvent("FULLSCREEN_EXIT", "MEDIUM", "Applicant exited full screen"); };
+    if (!joined || companyView) return undefined;
+    const visibility = () => {
+      if (document.hidden) logEvent("TAB_SWITCHED", "HIGH", "Applicant left the interview tab");
+    };
+    const blur = () => {
+      window.setTimeout(() => {
+        if (!permissionPromptActive.current && !document.hidden && !document.hasFocus()) {
+          logEvent("APP_SWITCHED", "HIGH", "Applicant switched to another window or application");
+        }
+      }, 0);
+    };
+    const fullscreen = () => {
+      const active = Boolean(document.fullscreenElement);
+      setPrecheckStatus((status) => ({ ...status, fullscreen: active }));
+      if (!active) {
+        setProctorReady(false);
+        logEvent("FULLSCREEN_EXIT", "MEDIUM", "Applicant exited full screen");
+      } else if (screenStream.current?.getVideoTracks().some((track) => track.readyState === "live")) {
+        setProctorReady(true);
+      }
+    };
     const screenTrack = screenStream.current?.getVideoTracks()[0];
-    const stopped = () => { setScreenShared(false); logEvent("SCREEN_SHARE_STOPPED", "HIGH", "Applicant stopped entire-screen sharing"); };
+    const stopped = () => {
+      setScreenShared(false);
+      setProctorReady(false);
+      setPrecheckStatus((status) => ({ ...status, screenShare: false }));
+      logEvent("SCREEN_SHARE_STOPPED", "HIGH", "Applicant stopped entire-screen sharing");
+    };
     document.addEventListener("visibilitychange", visibility);
     window.addEventListener("blur", blur);
     document.addEventListener("fullscreenchange", fullscreen);
@@ -141,7 +172,33 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
     const cleanups = [];
     const stream = proctorStream.current;
-    if (stream) {
+    const watchMediaTrack = (track, kind) => {
+      const stateKey = kind === "video" ? "camera" : "microphone";
+      const label = kind === "video" ? "Camera" : "Microphone";
+      const eventPrefix = kind === "video" ? "CAMERA" : "MIC";
+      const update = (available) => setPrecheckStatus((status) => ({ ...status, [stateKey]: available }));
+      const muted = () => {
+        update(false);
+        logEvent(`${eventPrefix}_INTERRUPTED`, "HIGH", `${label} stopped providing media`);
+      };
+      const unmuted = () => update(true);
+      const ended = () => {
+        update(false);
+        logEvent(`${eventPrefix}_OFF`, "HIGH", `${label} permission or device was turned off`);
+      };
+      track.addEventListener("mute", muted);
+      track.addEventListener("unmute", unmuted);
+      track.addEventListener("ended", ended);
+      cleanups.push(() => {
+        track.removeEventListener("mute", muted);
+        track.removeEventListener("unmute", unmuted);
+        track.removeEventListener("ended", ended);
+      });
+    };
+    stream?.getVideoTracks().forEach((track) => watchMediaTrack(track, "video"));
+    stream?.getAudioTracks().forEach((track) => watchMediaTrack(track, "audio"));
+
+    if (stream && coding?.status === "active") {
       const video = document.createElement("video");
       video.srcObject = stream; video.muted = true; video.playsInline = true;
       void video.play();
@@ -167,16 +224,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
       screenTrack?.removeEventListener("ended", stopped);
       cleanups.forEach((cleanup) => cleanup());
     };
-  }, [coding?.status, companyView, joined, logEvent, proctorReady]);
-
-  useEffect(() => {
-    if (coding?.status === "active") return;
-    screenStream.current?.getTracks().forEach((track) => track.stop());
-    screenStream.current = null;
-    setScreenShared(false);
-    setProctorReady(false);
-    if (document.fullscreenElement) void document.exitFullscreen().catch(() => {});
-  }, [coding?.status]);
+  }, [coding?.status, companyView, joined, logEvent, screenShared]);
 
   const poll = useCallback(async () => {
     try {
@@ -220,32 +268,129 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     return () => window.clearInterval(timer);
   }, [joined, poll]);
 
-  const enter = async () => {
+  const companyEnter = async () => {
     setJoining(true); setError("");
     try {
       if (!credentials.token) throw new Error("Your participant invitation token is missing.");
       await interviewApi.verifyToken(interview.id, credentials.role, credentials.token);
-      if (!companyView) {
-        if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not support the required camera and microphone.");
-        proctorStream.current = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        await interviewApi.precheck(interview.id, {
-          role: credentials.role,
-          token: credentials.token,
-          camera: proctorStream.current.getVideoTracks().some((track) => track.readyState === "live"),
-          microphone: proctorStream.current.getAudioTracks().some((track) => track.readyState === "live"),
-          screen_share: false,
-          fullscreen: false,
-        });
-      }
       await interviewApi.join(interview.id, credentials.role, credentials.token);
       setCurrent(await interviewApi.get(interview.id));
       setJoined(true);
     } catch (reason) {
       setError(reason.message || "Could not join the interview");
-      proctorStream.current?.getTracks().forEach((track) => track.stop());
-      screenStream.current?.getTracks().forEach((track) => track.stop());
-      proctorStream.current = null; screenStream.current = null;
     } finally { setJoining(false); }
+  };
+
+  const enableCameraAndMicrophone = async () => {
+    setJoining(true); setError(""); setMessage("");
+    try {
+      if (!credentials.token) throw new Error("Your participant invitation token is missing.");
+      if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser does not support the required camera and microphone.");
+      await interviewApi.verifyToken(interview.id, credentials.role, credentials.token);
+      permissionPromptActive.current = true;
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const camera = stream.getVideoTracks().some((track) => track.readyState === "live");
+      const microphone = stream.getAudioTracks().some((track) => track.readyState === "live");
+      if (!camera || !microphone) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("Both camera and microphone must be enabled to continue.");
+      }
+      proctorStream.current?.getTracks().forEach((track) => track.stop());
+      proctorStream.current = stream;
+      stream.getVideoTracks().forEach((track) => track.addEventListener("ended", () => {
+        setPrecheckStatus((status) => ({ ...status, camera: false }));
+      }, { once: true }));
+      stream.getAudioTracks().forEach((track) => track.addEventListener("ended", () => {
+        setPrecheckStatus((status) => ({ ...status, microphone: false }));
+      }, { once: true }));
+      setPrecheckStatus((status) => ({ ...status, camera, microphone }));
+      setMessage("Camera and microphone are ready. Next, share your entire screen.");
+    } catch (reason) {
+      setError(reason.message || "Could not enable the camera and microphone");
+    } finally {
+      permissionPromptActive.current = false;
+      setJoining(false);
+    }
+  };
+
+  const captureEntireScreen = async () => {
+    if (!navigator.mediaDevices?.getDisplayMedia) throw new Error("This browser does not support screen sharing.");
+    permissionPromptActive.current = true;
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: "monitor" }, audio: false });
+      const screenTrack = stream.getVideoTracks()[0];
+      const displaySurface = screenTrack?.getSettings?.().displaySurface;
+      if (!screenTrack || screenTrack.readyState !== "live") {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("Screen sharing did not start. Please try again.");
+      }
+      if (displaySurface && displaySurface !== "monitor") {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error("Choose Entire Screen, not a browser tab or window.");
+      }
+      screenStream.current?.getTracks().forEach((track) => track.stop());
+      screenStream.current = stream;
+      screenTrack.addEventListener("ended", () => {
+        setScreenShared(false);
+        setProctorReady(false);
+        setPrecheckStatus((status) => ({ ...status, screenShare: false }));
+      }, { once: true });
+      setScreenShared(true);
+      setPrecheckStatus((status) => ({ ...status, screenShare: true }));
+      return stream;
+    } finally {
+      permissionPromptActive.current = false;
+    }
+  };
+
+  const shareEntireScreen = async () => {
+    setJoining(true); setError(""); setMessage("");
+    try {
+      if (!precheckStatus.camera || !precheckStatus.microphone) {
+        throw new Error("Enable your camera and microphone first.");
+      }
+      await captureEntireScreen();
+      setMessage("Entire screen sharing is active. Enter full screen to finish the pre-check.");
+    } catch (reason) {
+      setError(reason.message || "Could not share the entire screen");
+    } finally { setJoining(false); }
+  };
+
+  const candidateEnter = async () => {
+    setJoining(true); setError(""); setMessage("");
+    try {
+      const camera = proctorStream.current?.getVideoTracks().some((track) => track.readyState === "live") || false;
+      const microphone = proctorStream.current?.getAudioTracks().some((track) => track.readyState === "live") || false;
+      const screenShare = screenStream.current?.getVideoTracks().some((track) => track.readyState === "live") || false;
+      if (!camera || !microphone || !screenShare) {
+        throw new Error("Complete the camera, microphone, and Entire Screen checks before joining.");
+      }
+      if (!document.fullscreenElement) {
+        permissionPromptActive.current = true;
+        await document.documentElement.requestFullscreen();
+      }
+      const fullscreen = Boolean(document.fullscreenElement);
+      setPrecheckStatus({ camera, microphone, screenShare, fullscreen });
+      if (!fullscreen) throw new Error("Full screen is required to complete the applicant pre-check.");
+      const result = await interviewApi.precheck(interview.id, {
+        role: credentials.role,
+        token: credentials.token,
+        camera,
+        microphone,
+        screen_share: screenShare,
+        fullscreen,
+      });
+      if (result?.status !== "passed") throw new Error("The applicant pre-check did not pass. Please confirm every permission and try again.");
+      await interviewApi.join(interview.id, credentials.role, credentials.token);
+      setCurrent(await interviewApi.get(interview.id));
+      setProctorReady(true);
+      setJoined(true);
+    } catch (reason) {
+      setError(reason.message || "Could not complete the applicant pre-check");
+    } finally {
+      permissionPromptActive.current = false;
+      setJoining(false);
+    }
   };
 
   const perform = async (work, success) => {
@@ -272,21 +417,22 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const enterProctoredWorkspace = async () => {
     setActionBusy(true); setError("");
     try {
-      if (!navigator.mediaDevices?.getDisplayMedia) throw new Error("This browser does not support screen sharing.");
-      screenStream.current = await navigator.mediaDevices.getDisplayMedia({ video: { displaySurface: "monitor" }, audio: false });
-      const displaySurface = screenStream.current.getVideoTracks()[0]?.getSettings?.().displaySurface;
-      if (displaySurface && displaySurface !== "monitor") {
-        screenStream.current.getTracks().forEach((track) => track.stop());
-        screenStream.current = null;
-        throw new Error("Choose Entire Screen, not a browser tab or window.");
+      const hasLiveScreen = screenStream.current?.getVideoTracks().some((track) => track.readyState === "live");
+      if (!hasLiveScreen) await captureEntireScreen();
+      if (!document.fullscreenElement) {
+        permissionPromptActive.current = true;
+        await document.documentElement.requestFullscreen();
       }
-      if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
       setScreenShared(true);
       setProctorReady(true);
+      setPrecheckStatus((status) => ({ ...status, screenShare: true, fullscreen: true }));
       logEvent("PROCTORED_WORKSPACE_ENTERED", "LOW", "Entire-screen sharing and full screen enabled");
     } catch (reason) {
       setError(reason.message || "Could not enter the proctored workspace");
-    } finally { setActionBusy(false); }
+    } finally {
+      permissionPromptActive.current = false;
+      setActionBusy(false);
+    }
   };
 
   const updateAnswer = (cellId, value) => {
@@ -325,16 +471,26 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
   return <div className={`video-room ${examActive && !companyView ? "proctored-mode" : ""}`}>
     <div className="video-room-header">
-      <span>{current.candidate_name && companyView ? `${current.candidate_name} · ` : ""}{current.job_id || "HireIQ Interview"}</span>
+      <span className="video-room-title">{current.candidate_name && companyView ? `${current.candidate_name} · ` : ""}{current.job_id || "HireIQ Interview"}{joined && !companyView && <small className={precheckStatus.camera && precheckStatus.microphone && precheckStatus.screenShare ? "monitoring-active" : "monitoring-warning"}>{precheckStatus.camera && precheckStatus.microphone && precheckStatus.screenShare ? "Monitoring active" : "Monitoring interrupted"}</small>}</span>
       <span className="video-room-timer">{examActive ? clock(coding.remaining_seconds) : (meetingJoined ? "Connected" : current.scheduling_status)}</span>
     </div>
     {error && <div className="interview-room-alert" role="alert">{error}</div>}
     {message && <div className="interview-room-message">{message}</div>}
 
     {!joined ? <div className="interview-prejoin-card">
-      <Video size={32} color="var(--primary)" /><h2>Ready to join?</h2>
-      <p>{companyView ? "Your company invitation will be verified before entry." : "Allow camera and microphone for the oral video call. Screen sharing is requested later only if the interviewer starts the proctored round."}</p>
-      <div className="portal-heading-actions"><button className="btn btn-primary" onClick={enter} disabled={joining}>{joining ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />} Verify & Join</button><button className="btn btn-outline" onClick={leave}>Cancel</button></div>
+      <Video size={32} color="var(--primary)" /><h2>{companyView ? "Ready to join?" : "Applicant device pre-check"}</h2>
+      <p>{companyView ? "Your company invitation will be verified before entry." : "Complete all three steps. Your browser will ask for camera, microphone, Entire Screen sharing, and full-screen access before the interview opens."}</p>
+      {!companyView && <div className="precheck-list" aria-label="Applicant pre-check status">
+        <div className={precheckStatus.camera ? "passed" : ""}><CheckCircle2 size={17} /><span>Camera</span><strong>{precheckStatus.camera ? "Ready" : "Required"}</strong></div>
+        <div className={precheckStatus.microphone ? "passed" : ""}><CheckCircle2 size={17} /><span>Microphone</span><strong>{precheckStatus.microphone ? "Ready" : "Required"}</strong></div>
+        <div className={precheckStatus.screenShare ? "passed" : ""}><CheckCircle2 size={17} /><span>Entire Screen</span><strong>{precheckStatus.screenShare ? "Sharing" : "Required"}</strong></div>
+      </div>}
+      {companyView ? <div className="portal-heading-actions"><button className="btn btn-primary" onClick={companyEnter} disabled={joining}>{joining ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />} Verify & Join</button><button className="btn btn-outline" onClick={leave}>Cancel</button></div> : <div className="precheck-actions">
+        <button className="btn btn-outline" onClick={enableCameraAndMicrophone} disabled={joining}>{precheckStatus.camera && precheckStatus.microphone ? <CheckCircle2 size={15} /> : <Video size={15} />} 1. Enable camera & microphone</button>
+        <button className="btn btn-outline" onClick={shareEntireScreen} disabled={joining || !precheckStatus.camera || !precheckStatus.microphone}>{precheckStatus.screenShare ? <CheckCircle2 size={15} /> : <MonitorUp size={15} />} 2. Share Entire Screen</button>
+        <button className="btn btn-primary" onClick={candidateEnter} disabled={joining || !precheckStatus.camera || !precheckStatus.microphone || !precheckStatus.screenShare}>{joining ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />} 3. Enter full screen & join</button>
+        <button className="btn btn-outline" onClick={leave}>Cancel</button>
+      </div>}
     </div> : <>
       <div className={`react-interview-layout ${companyView ? "interviewer" : "candidate"}`}>
         <main className={`react-meeting-stage ${examActive && !companyView ? "meeting-background" : ""}`}>

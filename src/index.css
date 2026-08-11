@@ -3475,6 +3475,10 @@ button {
   font-variant-numeric: tabular-nums;
   color: #9aa0a6;
 }
+.video-room-title { display: flex; align-items: center; gap: 10px; }
+.video-room-title small { border-radius: 999px; padding: 3px 8px; font-size: 10px; font-weight: 700; }
+.video-room-title .monitoring-active { background: #123d2e; color: #86efac; }
+.video-room-title .monitoring-warning { background: #4a1f25; color: #fca5a5; }
 .video-room-body {
   flex: 1;
   display: grid;
@@ -3773,6 +3777,14 @@ button {
   background: white;
 }
 .interview-prejoin-card p { color: var(--muted); line-height: 1.55; }
+.precheck-list { display: grid; gap: 8px; margin: 18px 0; }
+.precheck-list > div { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; color: var(--muted); font-size: 13px; }
+.precheck-list > div svg { color: #aeb6c5; }
+.precheck-list > div strong { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.precheck-list > div.passed { border-color: #86d3b3; background: #effbf5; color: #166448; }
+.precheck-list > div.passed svg { color: #1c8a61; }
+.precheck-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.precheck-actions .btn { justify-content: center; }
 .interview-room-alert,
 .interview-room-message {
   position: fixed;
