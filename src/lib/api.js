@@ -1,4 +1,6 @@
 import { supabase } from "./supabase.js";
+import { privateInterviewAssetRequest } from "./privateInterviewAssets.js";
+import { normalizeWrittenEvaluation } from "./writtenEvaluation.js";
 
 // Empty API origins intentionally use the current origin. Vite and the
 // production container proxy /api and /health for the monorepo deployment.
@@ -55,49 +57,6 @@ function normalizeOralRound(payload) {
     interviewer_notes: source.interviewer_notes ?? source.notes ?? "",
   };
   return payload?.round ? { ...payload, round } : { round, questions: [] };
-}
-
-function normalizedCodingStatus(status) {
-  if (["in_progress", "started"].includes(status)) return "active";
-  if (["submitted", "evaluating", "evaluated", "failed"].includes(status)) return "completed";
-  if (status === "pending") return "not_started";
-  return status;
-}
-
-function normalizeCodingRound(payload) {
-  if (!payload || typeof payload !== "object") return payload;
-  const workflowStatus = payload.workflow_status || payload.status || "not_started";
-  const evaluationStatus = payload.evaluation_status
-    || (workflowStatus === "evaluated" ? "completed" : workflowStatus === "evaluating" ? "processing" : workflowStatus === "failed" ? "failed" : "pending");
-  const breakdown = (payload.question_breakdown || payload.breakdown || []).map((item, index) => ({
-    ...item,
-    question_number: item.question_number ?? index + 1,
-    title: item.title || item.question || `Question ${index + 1}`,
-    max_marks: item.max_marks ?? item.maximum_marks ?? 5,
-    evaluation: item.evaluation || {
-      feedback: item.feedback || "",
-      strengths: item.strengths || [],
-      improvements: item.improvements || [],
-    },
-  }));
-  const maximumMarks = payload.max_marks ?? payload.maximum_marks ?? null;
-  const marksAwarded = payload.marks_awarded ?? payload.total_marks ?? null;
-  const remainingSeconds = payload.remaining_seconds ?? (() => {
-    const deadline = Date.parse(payload.deadline_at || "");
-    return Number.isFinite(deadline) ? Math.max(0, Math.floor((deadline - Date.now()) / 1000)) : null;
-  })();
-  return {
-    ...payload,
-    workflow_status: workflowStatus,
-    status: normalizedCodingStatus(workflowStatus),
-    evaluation_status: evaluationStatus,
-    marks_awarded: marksAwarded,
-    max_marks: maximumMarks,
-    score_percent: payload.score_percent ?? (maximumMarks > 0 && marksAwarded != null ? Math.round((marksAwarded / maximumMarks) * 10000) / 100 : null),
-    remaining_seconds: remainingSeconds,
-    breakdown,
-    answer_pdf_ready: payload.answer_pdf_ready ?? Boolean(payload.answer_pdf_url),
-  };
 }
 
 function localApiAlternatives(baseUrl) {
@@ -373,8 +332,8 @@ export const interviewApi = {
     method: "POST", body: JSON.stringify({ exam_duration_minutes: Number(minutes) }),
   }),
   skipCoding: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/skip`, { method: "POST" }),
-  retryEvaluation: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/evaluate`, { method: "POST" }),
-  codingStatus: async (id) => normalizeCodingRound(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/status`)),
+  retryEvaluation: async (id) => normalizeWrittenEvaluation(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/evaluate`, { method: "POST" })),
+  codingStatus: async (id) => normalizeWrittenEvaluation(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/coding-round/status`)),
   notebook: (id, token) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook?token=${encodeURIComponent(token)}`),
   saveAnswer: (id, cellId, token, code) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook/cell/${encodeURIComponent(cellId)}/update`, {
     method: "POST", body: JSON.stringify({ token, code }),
@@ -382,9 +341,9 @@ export const interviewApi = {
   runAnswer: (id, cellId, token, code) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook/cell/${encodeURIComponent(cellId)}/run`, {
     method: "POST", body: JSON.stringify({ token, code }),
   }),
-  submitAll: (id, token) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook/submit-all`, {
+  submitAll: async (id, token) => normalizeWrittenEvaluation(await interviewApiRequest(`/interviews/${encodeURIComponent(id)}/notebook/submit-all`, {
     method: "POST", body: JSON.stringify({ token }),
-  }),
+  })),
   generateReport: (id) => interviewApiRequest(`/interviews/${encodeURIComponent(id)}/generate-report`, { method: "POST" }),
   calendar: (query = "") => interviewApiRequest(`/calendar/events${query}`),
   createCalendarEvent: (payload) =>
@@ -449,35 +408,19 @@ export async function loadPrivateInterviewAsset(source) {
     throw new ApiError("Please sign in with Google", 401, "AUTH_REQUIRED");
   }
 
-  if (/^https?:\/\//i.test(source)) {
-    const sourceOrigin = new URL(source, window.location.origin).origin;
-    const apiOrigin = new URL(INTERVIEW_API_URL, window.location.origin).origin;
-    if (sourceOrigin !== apiOrigin) {
-      return { url: source, revoke: false, contentType: "application/pdf" };
-    }
-  }
-
   let response = null;
+  let requestError = null;
   for (const requestBase of localApiAlternatives(INTERVIEW_API_URL)) {
     try {
-      const requestOrigin = new URL(requestBase || "/", window.location.origin).origin;
-      const url = /^https?:\/\//i.test(source)
-        ? source
-        : source.startsWith("/api/")
-          ? `${requestOrigin}${source}`
-          : `${requestBase}${source.startsWith("/") ? "" : "/"}${source}`;
-      response = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${session.access_token}`,
-          Accept: "application/pdf",
-        },
-      });
+      const request = privateInterviewAssetRequest(source, requestBase, window.location.origin, session.access_token);
+      response = await fetch(request.url, { headers: request.headers });
       break;
-    } catch {
+    } catch (reason) {
+      requestError = reason;
       // Try the next local hostname, matching normal API requests.
     }
   }
-  if (!response) throw new ApiError("Could not reach the interview service", 0, "API_UNAVAILABLE");
+  if (!response) throw new ApiError(requestError?.message || "Could not reach the interview service", 0, "API_UNAVAILABLE");
   if (!response.ok) throw new ApiError("Could not load the applicant answer PDF", response.status);
   const blob = await response.blob();
   return { url: URL.createObjectURL(blob), revoke: true, contentType: blob.type };

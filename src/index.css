@@ -3939,6 +3939,22 @@ button {
 .answer-score-total span { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
 .answer-score-total strong { color: var(--primary-dark); font-size: 25px; }
 .answer-score-total small { color: var(--muted); }
+.answer-score-total p { margin: 4px 0 0; color: var(--ink); font-size: 12px; line-height: 1.5; }
+.written-evaluation-processing .answer-score-total,
+.written-evaluation-pending .answer-score-total { border-left: 3px solid #3b82f6; }
+.written-evaluation-failed .answer-score-total { border-left: 3px solid #dc2626; }
+.written-evaluation-configuration_required .answer-score-total { border-left: 3px solid #d97706; }
+.written-evaluation-completed .answer-score-total { border-left: 3px solid #16a34a; }
+.assessment-summary .written-evaluation { overflow: hidden; border: 1px solid #30343e; border-radius: 9px; }
+.assessment-summary .answer-score-total { background: #151b27; }
+.assessment-summary .answer-score-total strong,
+.assessment-summary .answer-score-total p { color: #e5e7eb; }
+.assessment-summary .answer-score-total span,
+.assessment-summary .answer-score-total small { color: #aeb8c8; }
+.assessment-summary .written-evaluation-question { display: grid; gap: 6px; padding: 12px; border-top: 1px solid #30343e; }
+.assessment-summary .written-evaluation-question > div { display: flex; justify-content: space-between; gap: 10px; }
+.assessment-summary .written-evaluation-question p,
+.assessment-summary .written-evaluation-question small { margin: 0; color: #b7c1d1; }
 .answer-evaluation-panel article { display: grid; gap: 7px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
 .answer-evaluation-panel article > div { display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; }
 .answer-evaluation-panel article > div span { flex: 0 0 auto; color: var(--primary-dark); font-weight: 700; }

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2, Clock3, FileCode2, LoaderCircle, MonitorUp, PhoneOff, Play, Save, ShieldCheck, TimerReset, Video } from "lucide-react";
+import WrittenEvaluation from "../../../WrittenEvaluation.jsx";
 import { interviewApi } from "../../../../lib/api.js";
 import { DEFAULT_ORAL_TIMER_SECONDS, loadOralQuestionTimers } from "../../../../lib/interviewTimers.js";
+import { createSingleFlight, evaluationPresentation, shouldPollEvaluation } from "../../../../lib/writtenEvaluation.js";
 
 
 const DEFAULT_APP_ID = import.meta.env.VITE_JAAS_APP_ID || "vpaas-magic-cookie-1fe1890c22f1421fb11848cbf09f62e7";
@@ -93,6 +95,22 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const meetingMediaReady = useRef(false);
   const meetingMediaState = useRef({ camera: null, microphone: null });
   const meetingShareTimeout = useRef(null);
+
+  const retryEvaluation = useMemo(() => createSingleFlight(async () => {
+    setActionBusy(true); setError(""); setMessage("");
+    try {
+      await interviewApi.retryEvaluation(interview.id);
+      const nextCoding = await interviewApi.codingStatus(interview.id);
+      setCoding(nextCoding);
+      setMessage("Evaluation restarted.");
+      return nextCoding;
+    } catch (reason) {
+      setError(reason.message || "Could not retry the written-answer evaluation");
+      return null;
+    } finally {
+      setActionBusy(false);
+    }
+  }), [interview.id]);
 
   const logEvent = useCallback((type, severity = "MEDIUM", detail = "") => {
     if (companyView) return;
@@ -319,12 +337,24 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
     }
   }, [companyView, credentials.token, interview.id]);
 
+  const roundFinished = ["completed", "skipped"].includes(coding?.status);
+  const keepRoomPolling = !coding || !roundFinished
+    || (coding.status === "completed" && shouldPollEvaluation(coding));
+
   useEffect(() => {
-    if (!joined) return undefined;
-    void poll();
-    const timer = window.setInterval(poll, 1500);
-    return () => window.clearInterval(timer);
-  }, [joined, poll]);
+    if (!joined || !keepRoomPolling) return undefined;
+    let cancelled = false;
+    let timer;
+    const refresh = async () => {
+      await poll();
+      if (!cancelled) timer = window.setTimeout(refresh, 1500);
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [joined, keepRoomPolling, poll]);
 
   useEffect(() => {
     if (!joined || (oral.round?.status !== "active" && coding?.status !== "active")) return undefined;
@@ -582,7 +612,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
   const submitExam = () => perform(async () => {
     await Promise.all((notebook?.cells || []).map((cell) => interviewApi.saveAnswer(interview.id, cell.cell_id, credentials.token, answers[cell.cell_id] || "")));
-    await interviewApi.submitAll(interview.id, credentials.token);
+    setCoding(await interviewApi.submitAll(interview.id, credentials.token));
   }, "Your answers were submitted.");
 
   const runAnswer = async (cell) => {
@@ -607,6 +637,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
   const examActive = coding?.status === "active";
   const activeCell = notebook?.cells.find((cell) => cell.cell_id === activeCellId) || notebook?.cells[0];
   const monitoringActive = precheckStatus.camera && precheckStatus.microphone && screenShared;
+  const evaluation = evaluationPresentation(coding, companyView);
 
   return <div className={`video-room ${examActive && !companyView ? "proctored-mode" : ""}`}>
     <div className="video-room-header">
@@ -670,9 +701,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
           </div>}
           {coding?.status === "completed" && <div className="start-proctored-box assessment-summary">
             <strong>Paper evaluation</strong>
-            <p>{coding.evaluation_status === "completed" ? `${coding.marks_awarded} / ${coding.max_marks} marks` : coding.evaluation_error || "Grok evaluation is in progress."}</p>
-            {coding.breakdown?.map((item) => <div className="assessment-breakdown-row" key={item.question_id}><span>Q{item.question_number} · {item.title}</span><strong>{item.marks_awarded ?? "—"} / 5</strong><small>{item.evaluation?.feedback || "Awaiting evaluation"}</small></div>)}
-            {coding.evaluation_status !== "completed" && <button className="btn btn-outline" disabled={actionBusy} onClick={() => perform(() => interviewApi.retryEvaluation(interview.id), "Evaluation refreshed.")}>Retry Grok evaluation</button>}
+            <WrittenEvaluation assessment={coding} allowRetry retrying={actionBusy} onRetry={retryEvaluation} />
           </div>}
           {!!events.length && <div className="proctor-event-list"><h3>Recent flags</h3>{events.slice(0, 6).map((event) => <div key={event.id}><strong>{event.event_type.replaceAll("_", " ")}</strong><span>{event.severity}</span></div>)}</div>}
         </aside>}
@@ -689,7 +718,7 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
 
       {!companyView && examActive && <section className="proctored-answer-page">
         {!proctorReady ? <div className="proctor-permission-card"><ShieldCheck size={36} /><h2>Enter the secure answer workspace</h2><p>The timer is running. Keep your Entire Screen shared with the interviewer and enter full screen to open the paper. The video call will continue securely in the background.</p>{screenShared ? <button className="btn btn-primary" disabled={actionBusy} onClick={enterProctoredWorkspace}><MonitorUp size={15} /> Enter full screen & continue</button> : <button className="btn btn-primary" disabled={actionBusy || meetingSharePending} onClick={shareScreenWithInterviewer}><MonitorUp size={15} /> Share Entire Screen</button>}</div> : <>
-          <header><div><h1><FileCode2 size={20} /> HireIQ Paper</h1><p>Autosaved · each question carries 5 marks · Grok evaluates the submitted PDF.</p></div><div className="proctored-header-actions"><span>{clock(coding.remaining_seconds)}</span>{!screenShared && <button className="btn btn-outline" onClick={enterProctoredWorkspace}><MonitorUp size={14} /> Resume screen share</button>}<button className="btn btn-primary" disabled={actionBusy || !notebook} onClick={submitExam}>Submit paper</button></div></header>
+          <header><div><h1><FileCode2 size={20} /> HireIQ Paper</h1><p>Autosaved · each question carries 5 marks · AI evaluates the submitted written answers.</p></div><div className="proctored-header-actions"><span>{clock(coding.remaining_seconds)}</span>{!screenShared && <button className="btn btn-outline" onClick={enterProctoredWorkspace}><MonitorUp size={14} /> Resume screen share</button>}<button className="btn btn-primary" disabled={actionBusy || !notebook} onClick={submitExam}>Submit paper</button></div></header>
           <div className="proctored-workbench">
             <aside className="paper-explorer"><strong>EXPLORER</strong><span>QUESTIONS</span>{notebook?.cells.map((cell, index) => <button className={cell.cell_id === activeCell?.cell_id ? "active" : ""} key={cell.cell_id} onClick={() => setActiveCellId(cell.cell_id)}><FileCode2 size={13} /> Q{index + 1} · {cell.title}</button>)}</aside>
             {activeCell && <article className="proctored-question" key={activeCell.cell_id}>
@@ -704,7 +733,12 @@ export default function InterviewRoomPage({ interview, user, onLeave }) {
         </>}
       </section>}
 
-      {!companyView && ["completed", "skipped"].includes(coding?.status) && <div className="interview-complete-overlay"><CheckCircle2 size={42} /><h2>{coding.status === "skipped" ? "Interview completed" : "Paper submitted"}</h2><p>{coding.status === "skipped" ? "The interviewer skipped the proctored round, so no question page was opened." : "Your PDF answer sheet was generated and sent for evaluation."}</p><button className="btn btn-primary" onClick={leave}>Return to HireIQ</button></div>}
+      {!companyView && ["completed", "skipped"].includes(coding?.status) && <div className="interview-complete-overlay">
+        {coding.status === "skipped" || evaluation.status === "completed" ? <CheckCircle2 size={42} /> : shouldPollEvaluation(coding) ? <LoaderCircle className="spin" size={42} /> : <FileCode2 size={42} />}
+        <h2>{coding.status === "skipped" ? "Interview completed" : evaluation.title}</h2>
+        <p>{coding.status === "skipped" ? "The interviewer skipped the proctored round, so no question page was opened." : evaluation.message}</p>
+        <button className="btn btn-primary" onClick={leave}>Return to HireIQ</button>
+      </div>}
 
       <div className="video-room-controls"><button className="video-control-btn leave" onClick={leave}><PhoneOff size={18} /><span>Leave HireIQ</span></button></div>
     </>}
